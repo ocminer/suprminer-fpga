@@ -19,17 +19,17 @@ supply causes rail droop → readback corruption on 2 of 4 FPGAs). ~65 % LUT, ro
 
 | GPU | MH/s | Power | MH/s/W | Temp |
 |-----|------|-------|--------|------|
-| RTX 3070 ×2 | 1206 / 1174 | 232 / 227 W | ~5.2 | 67–68 °C |
-| RTX 5090 ×2 | 2442 / 2377 | 535 / 560 W | ~4.4 | 65–85 °C |
-| RTX 5070 Ti | 475 | 222 W | ~2.1 | 62 °C |
+| RTX 3070 | 1206 | 230 W | ~5.2 | 67–68 °C |
+| RTX 5090 | 2442 | 546 W | ~4.5 | 65–85 °C |
+| RTX 5070 Ti | 475 | 224 W | ~2.1 | 62 °C |
 | **ZTEX 1.15y board** | **47.4** | **~30 W** | **1.58** | cool/passive |
-| RTX 5080 ×2 | 389 / 392 | 285 / 255 W | ~1.4 | 66–74 °C |
-| GTX 1080 Ti ×4 | building… | — | — | — |
+| RTX 5080 | 389 | 285 W | ~1.4 | 66–74 °C |
+| GTX 1080 Ti | 330 | 230 W | ~1.4 | — |
 
 ## Takeaways
-- **Efficiency:** the 2011-era Spartan-6 board (1.58 MH/s/W) beats the RTX 5080 (1.4) and is
-  within range of the 5070 Ti (2.1). The **RTX 3070 is the efficiency king (5.2 MH/s/W)** —
-  ~3.3× the FPGAs — followed by the 5090 (4.4).
+- **Efficiency:** the 2011-era Spartan-6 board (1.58 MH/s/W) beats the RTX 5080 and GTX 1080 Ti
+  (both 1.4) and is within range of the 5070 Ti (2.1). The **RTX 3070 is the efficiency king
+  (5.2 MH/s/W)** — ~3.3× the FPGAs — followed by the 5090 (4.5).
 - **Absolute throughput:** one RTX 3070 ≈ 25 ZTEX boards; one RTX 5090 ≈ 51 boards.
 - **Verdict:** FPGAs are worth running as owned/sunk-cost hardware (tiny 30 W draw, cool,
   quiet) but not worth buying more of vs used 3070s. If the bitstream reaches ~108 MHz
