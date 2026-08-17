@@ -2937,6 +2937,10 @@ static void *ztex_miner_thread(void *userdata)
 	int i, j, fd, rc, count;
 	uint32_t *target;
 	bool display_summary = false;
+	time_t last_hb = 0;   /* per-thread heartbeat timer (MUST NOT be static:
+	                       * a static here is shared across all board threads,
+	                       * so only ~one board per 30s wins the print race and
+	                       * the others never report — looks like starvation). */
 
 	uint32_t nonce, hash7, golden[2], hash[8];
 	struct timeval tv_start, tv_finish, elapsed, tv_end, diff;
@@ -3441,7 +3445,6 @@ static void *ztex_miner_thread(void *userdata)
 			// Always-on HW heartbeat (for the freq supervisor to parse).
 			// One line per ~30s: per-FPGA MH/s and cumulative HW errors.
 			{
-				static time_t last_hb = 0;
 				time_t nowt = time(NULL);
 				if (nowt - last_hb >= 30) {
 					last_hb = nowt;
