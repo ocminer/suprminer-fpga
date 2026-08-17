@@ -3398,8 +3398,38 @@ static void *ztex_miner_thread(void *userdata)
 					fpga->hashrate = 0.0;
 					for (i=0; i < num_fpgas; i++) {
 						uint32_t delta = last_nonce[i] - start_nonce[i];
-						ztex_stats[i].hashrate = (double)delta / elapsed_secs;
-						fpga->hashrate += ztex_stats[i].hashrate;
+						double raw = (double)delta / elapsed_secs;
+						ztex_stats[i].hashrate = raw;
+						/* Smoothed display value: MEDIAN of the last N raw samples.
+						 * The raw delta-nonce rate both spikes high (a stratum work
+						 * reset straddles the window) and dips low (partial window),
+						 * so a median is used — robust to both, and it never gets
+						 * "stuck" the way a ratio-gated EMA can.
+						 * A hard physical-ceiling clamp precedes the median: one
+						 * FPGA is 10 cores at <=96 MHz over ~76 cycles/hash =
+						 * ~12.6 MH/s absolute max, so any sample above 14 MH/s is a
+						 * work-reset delta artifact — drop it (don't store/count) so
+						 * a burst of artifacts can't bias the median. */
+						#define SHA3_FPGA_CEIL_MHS 14000000.0
+						if (raw > SHA3_FPGA_CEIL_MHS)
+							raw = 0.0;   /* artifact: skip this sample */
+						if (raw > 0.0) {
+							int H = (int)(sizeof(ztex_stats[i].hr_hist)/sizeof(double));
+							ztex_stats[i].hr_hist[ztex_stats[i].hr_idx % H] = raw;
+							ztex_stats[i].hr_idx++;
+							if (ztex_stats[i].hr_count < H) ztex_stats[i].hr_count++;
+							int n = ztex_stats[i].hr_count, k;
+							double tmp[25];
+							for (k = 0; k < n; k++) tmp[k] = ztex_stats[i].hr_hist[k];
+							/* insertion sort (n<=15) */
+							for (k = 1; k < n; k++) {
+								double v = tmp[k]; int j = k - 1;
+								while (j >= 0 && tmp[j] > v) { tmp[j+1] = tmp[j]; j--; }
+								tmp[j+1] = v;
+							}
+							ztex_stats[i].hashrate_smooth = tmp[n/2];
+						}
+						fpga->hashrate += ztex_stats[i].hashrate_smooth;
 					}
 				}
 			}
@@ -3418,7 +3448,7 @@ static void *ztex_miner_thread(void *userdata)
 					double board_mhps = 0.0; int board_active = 0;
 					for (i=0; i < num_fpgas; i++) {
 						if (!ztex_stats[i].enabled) continue;
-						double mhps = ztex_stats[i].hashrate/1000000.0;
+						double mhps = ztex_stats[i].hashrate_smooth/1000000.0;
 						double wmh = (mhps > 0.01) ? (opt_watts_per_fpga / mhps) : 0.0;
 						double mhw = (opt_watts_per_fpga > 0.01) ? (mhps / opt_watts_per_fpga) : 0.0;
 						applog(LOG_WARNING, "HEARTBEAT %s%d %.2f MH/s %.1fW %.2f MH/s/W %.3f W/MHs HWtotal=%u",
@@ -3493,7 +3523,7 @@ static void *ztex_miner_thread(void *userdata)
 			for (i=0; i < num_fpgas; i++) {
 
 				if(ztex_stats[i].enabled)
-					applog(LOG_WARNING, "Hash: %-4.2f Mh/s  Freq: %-3u Mhz  Submitted: %u  HW: %u", ztex_stats[i].hashrate / 1000000.0, (ztex_stats[i].freq + 1) * 4, ztex_stats[i].submitted, ztex_stats[i].hw_errors);
+					applog(LOG_WARNING, "Hash: %-4.2f Mh/s  Freq: %-3u Mhz  Submitted: %u  HW: %u", ztex_stats[i].hashrate_smooth / 1000000.0, (ztex_stats[i].freq + 1) * 4, ztex_stats[i].submitted, ztex_stats[i].hw_errors);
 				else
 					applog(LOG_WARNING, "Hash: DISABLED     Freq: %-3u Mhz  Submitted: %u  HW: %u", ztex_stats[i].hashrate / 1000000.0, (ztex_stats[i].freq + 1) * 4, ztex_stats[i].submitted, ztex_stats[i].hw_errors);
 					

@@ -192,7 +192,11 @@ extern void calc_midstate(unsigned char *data, const unsigned char *midstate);
 struct ztex_stats {
 	bool enabled;
 	int freq;
-	double hashrate;
+	double hashrate;         /* raw instantaneous (delta-nonce), spiky under work churn */
+	double hashrate_smooth;  /* median-filtered hashrate — for display (spike-robust) */
+	double hr_hist[25];      /* ring buffer of recent raw samples for the median filter */
+	int hr_idx;
+	int hr_count;
 	int submitted;
 	int hw_errors;
 	int freq_check_errors;
