@@ -3420,15 +3420,17 @@ static void *ztex_miner_thread(void *userdata)
 						if (!ztex_stats[i].enabled) continue;
 						double mhps = ztex_stats[i].hashrate/1000000.0;
 						double wmh = (mhps > 0.01) ? (opt_watts_per_fpga / mhps) : 0.0;
-						applog(LOG_WARNING, "HEARTBEAT %s%d %.2f MH/s %.1fW %.3f W/MHs HWtotal=%u",
-							fpga->short_name, i, mhps, opt_watts_per_fpga, wmh, ztex_stats[i].hw_errors);
+						double mhw = (opt_watts_per_fpga > 0.01) ? (mhps / opt_watts_per_fpga) : 0.0;
+						applog(LOG_WARNING, "HEARTBEAT %s%d %.2f MH/s %.1fW %.2f MH/s/W %.3f W/MHs HWtotal=%u",
+							fpga->short_name, i, mhps, opt_watts_per_fpga, mhw, wmh, ztex_stats[i].hw_errors);
 						board_mhps += mhps; board_active++;
 					}
 					if (board_active > 0) {
 						double board_w = board_active * opt_watts_per_fpga;
 						double board_wmh = (board_mhps > 0.01) ? (board_w / board_mhps) : 0.0;
-						applog(LOG_WARNING, "BOARD %s %d fpgas %.2f MH/s %.1fW %.3f W/MHs",
-							fpga->name, board_active, board_mhps, board_w, board_wmh);
+						double board_mhw = (board_w > 0.01) ? (board_mhps / board_w) : 0.0;
+						applog(LOG_WARNING, "BOARD %s %d fpgas %.2f MH/s %.1fW %.2f MH/s/W %.3f W/MHs",
+							fpga->name, board_active, board_mhps, board_w, board_mhw, board_wmh);
 					}
 				}
 			}
