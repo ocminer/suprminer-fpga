@@ -1,0 +1,31 @@
+# Bitstreams (not committed yet, per project decision)
+*.bit
+*.bit.*
+bitstreams/
+*.bgn
+*.drc
+*.ngc
+*.ngd
+*.bld
+*.xwbt
+
+# ISE / CMake build artifacts
+build/
+build-arm/
+_ngo/
+_xmsgs/
+xst/
+*.o
+*.zip
+*.log
+*.html
+
+# Compiled binaries / scratch
+fpga_miner
+fpga_miner_arm
+hash_test
+byte_order_test
+odo_test
+odo_verify
+odo_verify2
+fpga-miner.c.current

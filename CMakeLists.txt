@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 2.8)
 
-project(fpga_miner)
+project(fpga_miner C CXX)
 
 
 # Confirm LIBUSB Has Been Installed
@@ -52,10 +52,16 @@ set(SRC_LIST fpga-miner.c
 		util.c
 		./algo/blake256-8.c
 		./algo/groestl.c
+		./algo/sha3t.c
 		./algo/myr-groestl.c
 		./algo/sha2.c
 		./algo/sph_blake.c
 		./algo/sph_groestl.c
+		./algo/blake3.c
+		./algo/odohash.c
+		./algo/odocrypt_wrapper.cpp
+		./algo/odocrypt.cpp
+		./algo/KeccakP-800-reference.c
 	)
 			
 set(TARGET_NAME fpga_miner)
@@ -66,7 +72,7 @@ ELSE ( WIN32 )
 	add_executable(${TARGET_NAME} ${SRC_LIST})
 ENDIF ( WIN32 )
 
-target_link_libraries(${TARGET_NAME} crypto pthread ${CURL_LIBRARIES} ${LIBUSB_LIBRARIES} jansson)
+target_link_libraries(${TARGET_NAME} pthread ${CURL_LIBRARIES} ${LIBUSB_LIBRARIES} jansson)
 
 IF(WIN32)
 	target_link_libraries(${TARGET_NAME} Ws2_32)

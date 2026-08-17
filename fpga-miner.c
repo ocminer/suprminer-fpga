@@ -46,6 +46,7 @@
 #endif
 
 #include "miner.h"
+#include "algo/blake3.h"
 
 #ifdef WIN32
 #include "compat/winansi.h"
@@ -76,6 +77,9 @@ enum algos {
 	ALGO_MYR_GR,      // Myriad Groestl (double SHA256 on merkle)
 	ALGO_BLAKECOIN,   // Blake 256 - 8 Rounds (single SHA256 on merkle)
 	ALGO_VCASH,       // Blake 256 - 8 Rounds (double SHA256 on merkle)
+	ALGO_BLAKE3,      // BLAKE3 - Decred DCP-0011 (180-byte header)
+	ALGO_ODO,         // OdoCrypt - DigiByte (standard 80-byte header)
+	ALGO_SHA3T,       // SHA3-256t - BitcoinIII/BC3 (standard 80-byte header)
 	ALGO_COUNT
 };
 
@@ -85,6 +89,9 @@ static const char *algo_names[] = {
 	"myr-gr",
 	"blakecoin",
 	"vcash",
+	"blake3",
+	"odo",
+	"sha3t",
 	"\0"
 };
 
@@ -166,8 +173,10 @@ bool opt_use_cpu = false;
 bool opt_use_serial = false;
 bool opt_use_ztex = false;
 bool opt_auto_freq = false;
+double opt_watts_per_fpga = 7.5;  /* measured wall-power per FPGA (tune to your meter); for W/MH efficiency display */
 bool opt_fpga_summary = false;
 bool opt_firmware = false;
+unsigned char g_saved_send[4][84]; /* DIAG: saved send buffers for verification */
 
 int g_miner_count;
 int g_fpga_count;
@@ -177,6 +186,7 @@ int g_serial_device_count;
 
 int g_ztex_freq = 24;	// Default = 100 Mhz
 int g_fpga_work_len = 80;
+int g_nonce_word_index = 19;  // word index of nonce in work.data (19 for 80-byte, 35 for Decred)
 bool g_fpga_use_midstate = false;
 
 int g_block_count = 0;
@@ -199,6 +209,7 @@ Options:\n\
   -a, --algo <algo>          The mining algorithm to use\n\
                                dmd-gr       Diamond-Groestl\n\
                                groestl      GroestlCoin\n\
+                               odo          OdoCrypt (DigiByte)\n\
                                myr-gr       Myriad-Groestl\n\
 							   blake256-8  Blake256 - 8 Rounds\n\
   -o, --url=URL              URL of mining server\n\
@@ -248,7 +259,7 @@ Options while mining ----------------------------------------------------------\
 
 
 static char const short_options[] =
-	"a:b:c:C:D:f:F:h:m:p:Px:q:r:R:s:S:t:T:o:u:O:V:z";
+	"a:b:c:C:Df:Fh:m:p:Px:q:r:R:s:S:t:T:o:u:O:V:z:";
 
 static struct option const options[] = {
 	{ "algo", 1, NULL, 'a' },
@@ -288,6 +299,7 @@ static struct option const options[] = {
 	{ "userpass", 1, NULL, 'O' },
 	{ "ztex", 1, NULL, 'z' },
 	{ "auto-freq", 0, NULL, 1004 },
+	{ "watts-per-fpga", 1, NULL, 1008 },
 	{ "firmware", 0, NULL, 'F' },
 	{ "version", 0, NULL, 'V' },
 	{ 0, 0, 0, 0 }
@@ -837,6 +849,10 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 
 			bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
 			bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
+			if (opt_algo == ALGO_ODO && opt_debug) {
+				applog(LOG_DEBUG, "STRATUM_SUBMIT: job=%s nonce=%s ntime=%s data19=%08X",
+					work->job_id, noncestr, ntimestr, work->data[19]);
+			}
 			xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
 			snprintf(s, JSON_BUF_LEN,
 					"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
@@ -1332,9 +1348,10 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		switch (opt_algo) {
 			case ALGO_GROESTL:
 			case ALGO_BLAKECOIN:
-				SHA256(sctx->job.coinbase, (int) sctx->job.coinbase_size, merkle_root);
+				sha256(sctx->job.coinbase, (int) sctx->job.coinbase_size, merkle_root);
 				break;
 			default:
+				/* DigiByte (OdoCrypt) and most coins use SHA256d for coinbase */
 				sha256d(merkle_root, sctx->job.coinbase, (int) sctx->job.coinbase_size);
 		}
 
@@ -1348,16 +1365,72 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			;
 
 		/* Assemble block header */
-		memset(work->data, 0, 128);
-		work->data[0] = le32dec(sctx->job.version);
-		for (i = 0; i < 8; i++)
-			work->data[1 + i] = le32dec((uint32_t *) sctx->job.prevhash + i);
-		for (i = 0; i < 8; i++)
-			work->data[9 + i] = be32dec((uint32_t *) merkle_root + i);
-		work->data[17] = le32dec(sctx->job.ntime);
-		work->data[18] = le32dec(sctx->job.nbits);
-		work->data[20] = 0x80000000;
-		work->data[31] = 0x00000280;
+		if (opt_algo == ALGO_BLAKE3) {
+			/*
+			 * Decred stratum header reconstruction:
+			 *
+			 * Pool sends via mining.notify:
+			 *   version  (4 bytes from param[5])
+			 *   prevBlock (32 bytes from param[1])
+			 *   genTx1   (144 bytes from param[2]) = header[36:180]
+			 *   nTime    (4 bytes from param[7])
+			 *   nBits    (4 bytes from param[6])
+			 *
+			 * The coinbase buffer = coinb1 + xnonce1 + xnonce2 + coinb2
+			 * For Decred: coinb1 = genTx1 (144 bytes = header[36:180])
+			 *
+			 * Reconstructed 180-byte header layout:
+			 *   [0:4]     = version
+			 *   [4:36]    = prevBlock
+			 *   [36:144]  = genTx1[0:108] (merkleRoot through nonce)
+			 *   [144:148] = extraNonce1 (from xnonce1)
+			 *   [148:152] = extraNonce2 (from xnonce2)
+			 *   [152:180] = genTx1[116:144] (remaining ExtraData + StakeVersion)
+			 *
+			 * But actually, the coinbase already has xnonce1+xnonce2 spliced in
+			 * by stratum_notify, so coinbase = genTx1[0:108] + xnonce1 + xnonce2 + coinb2
+			 * = full header[36:180] with extranonces filled in.
+			 */
+			unsigned char hdr[180];
+			memset(hdr, 0, 180);
+
+			/* Bytes 0-3: version */
+			memcpy(hdr, sctx->job.version, 4);
+
+			/* Bytes 4-35: prevhash */
+			memcpy(hdr + 4, sctx->job.prevhash, 32);
+
+			/* Bytes 36-179: from coinbase (which is genTx1 + xnonce1 + xnonce2 + coinb2) */
+			if (sctx->job.coinbase_size >= 144) {
+				memcpy(hdr + 36, sctx->job.coinbase, 144);
+			}
+
+			/* Overwrite nTime at offset 136 with the notify value */
+			memcpy(hdr + 136, sctx->job.ntime, 4);
+
+			/* Clear nonce at offset 140 - FPGA will scan it */
+			memset(hdr + 140, 0, 4);
+
+			/* Load into work.data as LE uint32 words */
+			memset(work->data, 0, 192);
+			for (i = 0; i < 45; i++)
+				work->data[i] = le32dec(hdr + i * 4);
+
+			work->height = work->data[32];  /* height at offset 128 = word 32 */
+		} else {
+			/* Standard path (groestl, OdoCrypt, etc.):
+			 * Same work.data format as groestl — proven to work with stratum. */
+			memset(work->data, 0, 128);
+			work->data[0] = le32dec(sctx->job.version);
+			for (i = 0; i < 8; i++)
+				work->data[1 + i] = le32dec((uint32_t *) sctx->job.prevhash + i);
+			for (i = 0; i < 8; i++)
+				work->data[9 + i] = be32dec((uint32_t *) merkle_root + i);
+			work->data[17] = le32dec(sctx->job.ntime);
+			work->data[18] = le32dec(sctx->job.nbits);
+			work->data[20] = 0x80000000;
+			work->data[31] = 0x00000280;
+		}
 
 		switch (opt_algo) {
 			case ALGO_DMD_GR:
@@ -1580,6 +1653,9 @@ static void *miner_thread(void *userdata)
 		case ALGO_BLAKECOIN:
 		case ALGO_VCASH:
 			rc = scanhash_blakecoin(thr_id, work.data, work.target, max_nonce, &hashes_done);
+			break;
+		case ALGO_SHA3T:
+			rc = scanhash_sha3t(thr_id, work.data, work.target, max_nonce, &hashes_done);
 			break;
 		default:
 			/* should never happen */
@@ -2218,6 +2294,10 @@ void parse_arg(int key, char *arg)
 	case 1004:
 		opt_auto_freq = true;
 		break;
+	case 1008:
+		opt_watts_per_fpga = atof(arg);
+		if (opt_watts_per_fpga <= 0) opt_watts_per_fpga = 7.5;
+		break;
 	case 1007:
 		want_stratum = false;
 		opt_extranonce = false;
@@ -2455,6 +2535,18 @@ static bool detect_fpga()
 			case ALGO_VCASH:
 				bitstream = "ztex_blake256_8.bit";
 				break;
+			case ALGO_BLAKE3:
+				bitstream = "blake3_dcr.bit";
+				break;
+			case ALGO_ODO:
+				bitstream = "odo_dgb.bit";
+				break;
+			case ALGO_SHA3T:
+				bitstream = "ztex_sha3.bit";
+				break;
+			default:
+				bitstream = "ztex_groestl.bit";
+				break;
 		}
 		
 		for (i = 0; i < g_ztex_fpga_count; i++) {
@@ -2468,16 +2560,32 @@ static bool detect_fpga()
 
 			applog(LOG_WARNING,"%s: Found Ztex Board (fpga count = %d), ID #%d", ztex_info[i].repr, ztex_info[i].numberOfFpgas, i);
 			
-			for (j = 0; j < ztex_info[i].numberOfFpgas; j++) {
-			
-				if(!libztex_selectFpga(&ztex_info[i], j)) return false;
-				libztex_resetFpga(&ztex_info[i]);
-				if(!libztex_configureFpga(&ztex_info[i], bitstream)) return false;
-				if(!libztex_setFreq(&ztex_info[i], g_ztex_freq)) return false;
-				applog(LOG_WARNING, "%s-%d: Successfully configured", ztex_info[i].repr, j);
-
-				nmsleep(200);				
-			
+			/* Configure all FPGAs directly.
+			 * With UnusedPin:PullNone in bitgen, all 4 configure reliably. */
+			{
+				int num_ok = 0;
+				const char *only = getenv("FPGA_ONLY");   /* debug: comma list of FPGAs to run */
+				const char *order = getenv("FPGA_ORDER"); /* config order, e.g. "1230" */
+				int oi;
+				for (oi = 0; oi < ztex_info[i].numberOfFpgas; oi++) {
+					j = order ? (order[oi] - '0') : oi;   /* configure in FPGA_ORDER sequence */
+					char jc = '0' + j;
+					if (only && !strchr(only, jc)) {
+						applog(LOG_WARNING, "%s-%d: skipped (FPGA_ONLY=%s)", ztex_info[i].repr, j, only);
+						continue;
+					}
+					if(!libztex_selectFpga(&ztex_info[i], j)) return false;
+					if(!libztex_configureFpga(&ztex_info[i], bitstream)) {
+						applog(LOG_ERR, "%s-%d: Configuration failed, skipping", ztex_info[i].repr, j);
+						continue;
+					}
+					if(!libztex_setFreq(&ztex_info[i], g_ztex_freq)) return false;
+					applog(LOG_WARNING, "%s-%d: Successfully configured", ztex_info[i].repr, j);
+					num_ok++;
+					nmsleep(200);
+				}
+				applog(LOG_WARNING, "%s: %d of %d FPGAs running",
+					ztex_info[i].repr, num_ok, ztex_info[i].numberOfFpgas);
 			}			
 		}
 
@@ -2535,7 +2643,10 @@ static bool initialize_ztex_miner(void *thr, int ztex_num)
 	fpga->ztex_stats = (struct ztex_stats *) calloc(ztex_info[ztex_num].numberOfFpgas, sizeof(struct ztex_stats));
 	
 	for(i=0; i<ztex_info[ztex_num].numberOfFpgas; i++) {
-		fpga->ztex_stats[i].enabled = true;
+		{
+			const char *only = getenv("FPGA_ONLY");
+			fpga->ztex_stats[i].enabled = (!only || strchr(only, '0' + i) != NULL);
+		}
 		fpga->ztex_stats[i].hashrate = 0.0;
 		fpga->ztex_stats[i].freq = g_ztex_freq;
 		gettimeofday(&fpga->ztex_stats[i].freq_check_tv, NULL);
@@ -2546,22 +2657,45 @@ static bool initialize_ztex_miner(void *thr, int ztex_num)
 
 extern void calc_hash(unsigned char *data, const unsigned char *hash)
 {
-	uint32_t endian_data[20];
+	uint32_t endian_data[48];
 	uint32_t *data32 = (uint32_t *)(data);
 
-	swap_endian(endian_data, data32, 80);
-
 	switch (opt_algo) {
+		case ALGO_BLAKE3:
+			/* BLAKE3: work.data is already in LE format, hash directly
+			 * (180 bytes = 45 words, no swap_endian needed for BLAKE3) */
+			blake3_hash_180((void *)data32, (void *)hash);
+			break;
+		case ALGO_ODO:
+		{
+			/* OdoCrypt: full swap_endian (matches nonce_bswap in FPGA) */
+			extern void odohash(void *output, const void *input, uint32_t odo_key);
+			swap_endian(endian_data, data32, 80);
+			uint32_t ntime = endian_data[17];
+			uint32_t odo_key = ntime - ntime % 864000;
+			odohash((void *)hash, (void *)endian_data, odo_key);
+			break;
+		}
 		case ALGO_DMD_GR:
 		case ALGO_GROESTL:
+			swap_endian(endian_data, data32, 80);
 			groestlhash((void *)hash, (void *)endian_data);
 			break;
 		case ALGO_MYR_GR:
+			swap_endian(endian_data, data32, 80);
 			myriadhash((void *)hash, (void *)endian_data);
 			break;
 		case ALGO_BLAKECOIN:
 		case ALGO_VCASH:
+			swap_endian(endian_data, data32, 80);
 			blake256_8_hash((void *)hash, (void *)endian_data);
+			break;
+		case ALGO_SHA3T:
+			swap_endian(endian_data, data32, 80);
+			sha3256t_hash((void *)hash, (void *)endian_data);
+			break;
+		default:
+			swap_endian(endian_data, data32, 80);
 			break;
 	}
 }
@@ -2590,7 +2724,7 @@ static void *serial_miner_thread(void *userdata)
 	int thr_id = mythr->id;
 	struct work work = {{0}};
 	int i, fd, ret;
-	unsigned char data[80], midstate[32], send_buf[80], nonce_buf[SERIAL_READ_SIZE];
+	unsigned char data[184], midstate[32], send_buf[184], nonce_buf[SERIAL_READ_SIZE];
 	uint32_t *target;
 	bool display_summary = false;
 
@@ -2639,16 +2773,39 @@ static void *serial_miner_thread(void *userdata)
 		if ( g_fpga_use_midstate ) {
 			calc_midstate((unsigned char *)work.data, (unsigned char *)midstate);
 			memcpy(data, midstate, 32);
-			memcpy(data + 32, (unsigned char*)work.data + 64, 12);	// Copy Midstate & Remaining 12 Bytes Of Block Header
+			memcpy(data + 32, (unsigned char*)work.data + 64, 12);
+		}
+		else if (opt_algo == ALGO_BLAKE3) {
+			/* Same precompute as ZTEX path - see ztex_miner_thread */
+			uint32_t iv[8] = {
+				0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+				0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+			};
+			uint32_t cv0[8], cv[8], bw[16];
+			int w;
+			for (w = 0; w < 16; w++) bw[w] = work.data[w];
+			blake3_compress_host(iv, bw, 0, 64, 1, cv0);
+			for (w = 0; w < 16; w++) bw[w] = work.data[16 + w];
+			blake3_compress_host(cv0, bw, 0, 64, 0, cv);
+			memcpy(data, (unsigned char *)cv, 32);
+			memcpy(data + 32, (unsigned char *)&work.data[32], 12);
+			memcpy(data + 44, (unsigned char *)&work.data[36], 36);
+			memcpy(data + 80, (unsigned char *)work.target + 28, 4);
 		}
 		else {
 			memcpy(data, (unsigned char*)work.data, 76);
-			memcpy(data + 76, (unsigned char*)work.target + 28, 4);  // Used To Pass H7 Target To FPGA
+			memcpy(data + 76, (unsigned char*)work.target + 28, 4);
 		}
 
-		// Change Endianess On Each 4 Byte Chunk
-		swap_endian(send_buf, data, g_fpga_work_len);
-		
+		// Prepare send buffer
+		if (opt_algo == ALGO_BLAKE3) {
+			int l;
+			for (l = 0; l < g_fpga_work_len; l++)
+				send_buf[l] = data[g_fpga_work_len - 1 - l];
+		} else {
+			swap_endian(send_buf, data, g_fpga_work_len);
+		}
+
 		// Send Data To FPGA
 		ret = write(fd, send_buf, g_fpga_work_len);
 
@@ -2695,7 +2852,7 @@ static void *serial_miner_thread(void *userdata)
 			nonce = swab32(nonce);
 
 			// Calculate Hash Using Nonce By FPGA
-			work.data[19] = nonce;
+			work.data[g_nonce_word_index] = nonce;
 			calc_hash((unsigned char *)work.data, (unsigned char *)hash);
 			
 			// Check If Hash < Target Sent To FPGA
@@ -2786,9 +2943,10 @@ static void *ztex_miner_thread(void *userdata)
 
 	uint32_t golden_nonce1, golden_nonce2;
 	uint32_t last_nonce[4], last_golden1[4], last_golden2[4], hw_errors[4];
+	uint32_t start_nonce[4];  // nonce value at start of work item, for delta-based rate calc
 	bool overflow[4];
 	
-	unsigned char data[80], send_buf[80], midstate[32];
+	unsigned char data[184], send_buf[184], midstate[32];
 	unsigned char* b = (unsigned char*)send_buf;
 
 	int num_fpgas = ztex->numberOfFpgas;
@@ -2823,20 +2981,131 @@ static void *ztex_miner_thread(void *userdata)
 			if ( g_fpga_use_midstate ) {
 				calc_midstate((unsigned char *)work[i].data, (unsigned char *)midstate);
 				memcpy(data, midstate, 32);
-				memcpy(data + 32, (unsigned char*)work[i].data + 64, 12);	// Copy Midstate & Remaining 12 Bytes Of Block Header
+				memcpy(data + 32, (unsigned char*)work[i].data + 64, 12);
+			}
+			else if (opt_algo == ALGO_ODO) {
+					/*
+					 * OdoCrypt/DigiByte: Send 76 raw LE bytes (header without nonce).
+					 * FPGA generates nonce internally.
+					 * Shift register puts first byte at LSB = byte 0 of header.
+					 * No byte reversal or swap needed.
+					 */
+					/* Send 76 bytes of work.data; swap_endian applied later in send path */
+					memcpy(data, (unsigned char*)work[i].data, 76);
+					/* ODO DIAG: compute hash for nonce=0 to verify */
+					if (count <= 1 && i == 0) {
+						extern void odohash(void *output, const void *input, uint32_t odo_key);
+						uint32_t diag_header[20];
+						swap_endian(diag_header, (uint32_t*)work[i].data, 80);
+						diag_header[19] = 0; /* nonce = 0 (LE) */
+						uint32_t diag_hash[8];
+						uint32_t ntime = diag_header[17]; /* correct integer after swap */
+						uint32_t okey = ntime - ntime % 864000;
+						odohash(diag_hash, diag_header, okey);
+						applog(LOG_DEBUG, "ODO_DIAG: nonce=0 hash7=%08X key=%u ntime=%08X",
+							diag_hash[7], okey, ntime);
+					}
+				}
+				else if (opt_algo == ALGO_BLAKE3) {
+				/*
+				 * BLAKE3/Decred: Host precomputes blocks 0-1, sends 84 bytes:
+				 *   Bytes 0-31:  CV after block 1 (from precompute)
+				 *   Bytes 32-43: Block 2 m[0]-m[2] (Height, Size, Timestamp)
+				 *   Bytes 44-79: Block 2 m[4]-m[12] (ExtraData + StakeVersion)
+				 *   Bytes 80-83: Target (hash7 threshold)
+				 *
+				 * work.data[0..44] = full 180-byte header as LE uint32 words
+				 * Block 0 = words 0-15, Block 1 = words 16-31
+				 * Block 2 = words 32-44 (m[0]=w32, m[1]=w33, m[2]=w34, m[3]=w35=nonce,
+				 *           m[4]=w36, ..., m[12]=w44)
+				 */
+				{
+					uint32_t cv[8], block_words[16];
+					unsigned char *hdr = (unsigned char *)work[i].data;
+					int w;
+
+					/* Block 0: header words 0-15 (bytes 0-63) */
+					for (w = 0; w < 16; w++)
+						block_words[w] = work[i].data[w];
+
+					/* Compress block 0: CV=IV, flags=CHUNK_START */
+					extern void blake3_compress_host(const uint32_t cv[8],
+						const uint32_t block_words[16], uint64_t counter,
+						uint32_t block_len, uint32_t flags, uint32_t out[8]);
+
+					uint32_t iv[8] = {
+						0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+						0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+					};
+					uint32_t cv0[8];
+					blake3_compress_host(iv, block_words, 0, 64, 1, cv0); /* CHUNK_START=1 */
+
+					/* Block 1: header words 16-31 (bytes 64-127) */
+					for (w = 0; w < 16; w++)
+						block_words[w] = work[i].data[16 + w];
+					blake3_compress_host(cv0, block_words, 0, 64, 0, cv); /* flags=0 */
+
+					/* Pack 84-byte work unit */
+					/* CV: 32 bytes */
+					memcpy(data, (unsigned char *)cv, 32);
+					/* Block2 m[0]-m[2]: words 32-34 (Height, Size, Timestamp) */
+					memcpy(data + 32, (unsigned char *)&work[i].data[32], 12);
+					/* Block2 m[4]-m[12]: words 36-44 (ExtraData + StakeVersion) */
+					memcpy(data + 44, (unsigned char *)&work[i].data[36], 36);
+					/* Target: send relaxed target (0xFF) for debugging golden flow.
+				 * hash7 <= 0xFF: ~1 in 16M hashes, ~0.6/sec at 10 MH/s */
+					{
+						uint32_t fpga_tgt = 0x000000FF;
+						memcpy(data + 80, &fpga_tgt, 4);
+					}
+
+					/* DIAGNOSTIC: verify precompute matches full hash */
+					if (count <= 2) {
+						uint32_t test_nonce = 0x42;
+						uint32_t full_hash[8], pre_hash[8];
+						uint32_t saved_nonce = work[i].data[35];
+						work[i].data[35] = test_nonce;
+						blake3_hash_180((void*)work[i].data, (void*)full_hash);
+
+						/* Block 2 via precompute */
+						uint32_t b2[16];
+						b2[0] = work[i].data[32]; b2[1] = work[i].data[33]; b2[2] = work[i].data[34];
+						b2[3] = test_nonce;
+						for (w = 4; w < 13; w++) b2[w] = work[i].data[32 + w];
+						b2[13] = 0; b2[14] = 0; b2[15] = 0;
+						blake3_compress_host(cv, b2, 0, 52, 2|8, pre_hash);
+
+						applog(LOG_DEBUG, "DIAG: full_hash7=%08X pre_hash7=%08X %s",
+							full_hash[7], pre_hash[7],
+							full_hash[7] == pre_hash[7] ? "MATCH" : "MISMATCH");
+						applog(LOG_DEBUG, "DIAG: CV=%08X%08X%08X%08X%08X%08X%08X%08X",
+							cv[7],cv[6],cv[5],cv[4],cv[3],cv[2],cv[1],cv[0]);
+						work[i].data[35] = saved_nonce;
+					}
+				}
 			}
 			else {
 				memcpy(data, (unsigned char*)work[i].data, 76);
-				memcpy(data + 76, (unsigned char*)work[i].target + 28, 4);  // Used To Pass H7 Target To FPGA
+				memcpy(data + 76, (unsigned char*)work[i].target + 28, 4);
 			}
 
-			// Change Endianess On Each 4 Byte Chunk
-			swap_endian(send_buf, data, g_fpga_work_len);
-			
+			// Prepare send buffer
+			if (opt_algo == ALGO_BLAKE3) {
+				// BLAKE3: send raw LE bytes, no manipulation needed.
+				memcpy(send_buf, data, g_fpga_work_len);
+			} else {
+				// Standard (Groestl etc): swap_endian (byte-reverse each 4-byte word)
+				swap_endian(send_buf, data, g_fpga_work_len);
+			}
+
 			applog(LOG_DEBUG, "%s BUF_1: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", fpga->short_name, b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15],b[16],b[17],b[18],b[19],b[20],b[21],b[22],b[23],b[24],b[25],b[26],b[27],b[28],b[29],b[30],b[31],b[32],b[33],b[34],b[35],b[36],b[37],b[38],b[39]);
 			applog(LOG_DEBUG, "%s BUF_2: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", fpga->short_name, b[40],b[41],b[42],b[43],b[44],b[45],b[46],b[47],b[48],b[49],b[50],b[51],b[52],b[53],b[54],b[55],b[56],b[57],b[58],b[59],b[60],b[61],b[62],b[63],b[64],b[65],b[66],b[67],b[68],b[69],b[70],b[71],b[72],b[73],b[74],b[75],b[76],b[77],b[78],b[79]);
 
 			// Send Work To FPGA
+			{	/* DIAG: save send buffer for later comparison */
+				extern unsigned char g_saved_send[4][84];
+				memcpy(g_saved_send[i], send_buf, g_fpga_work_len);
+			}
 			libztex_selectFpga(ztex, i);
 			rc = libztex_sendData(ztex, send_buf, g_fpga_work_len);
 			if (rc < 0) {
@@ -2852,7 +3121,11 @@ static void *ztex_miner_thread(void *userdata)
 			overflow[i] = false;
 			last_golden1[i] = 0;
 			last_golden2[i] = 0;
-			last_nonce[i] = 0;
+			// SHA3T cores reset their nonce counter to 0 on new work, so the
+			// baseline is 0 and last_nonce tracks the running max (see readback).
+			if (opt_algo == ALGO_SHA3T)
+				last_nonce[i] = 0;
+			start_nonce[i] = last_nonce[i];  // snapshot current nonce as baseline for delta calc
 			hw_errors[i] = 0;
 		
 		}
@@ -2897,23 +3170,152 @@ static void *ztex_miner_thread(void *userdata)
 					}
 				}
 
+				// Debug: log raw readback data
+				if (count <= 5)
+					applog(LOG_DEBUG, "%s%d: readback nonce=%08X hash7=%08X golden1=%08X golden2=%08X", fpga->short_name, i, nonce, hash7, golden[0], golden[1]);
+
 				// Get Rid of FPGA Noise
 				if ((nonce == 0x00000000) || (nonce == hash7))
 					continue;
 
-				// Check For Hardware Errors On The FPGA
-				work[i].data[19] = nonce;
-				if (ztex_checkNonce((unsigned char*)work[i].data) != hash7) {
-					if (count > 2) {	// Only Count Errors After The First 500ms Of Work Being Sent To FPGA
+				// NOTE: the diagnostic (nonce,hash7) readback pair is NOT a
+				// reliable overclock signal — empirically the pair is not always
+				// atomic across the readback, so re-hashing the readback nonce
+				// gives false mismatches even when compute is correct (goldens
+				// still verify 100%). The reliable HW-error signal for --auto-freq
+				// is a reported GOLDEN that fails host re-verification (below).
+
+				// ODO VERIFY: compare host hash with FPGA hash for readback nonce
+				if (opt_algo == ALGO_ODO && count == 3 && i == 0) {
+					extern void odohash(void *output, const void *input, uint32_t odo_key);
+					uint32_t endian_data[20], vhash[8];
+					swap_endian(endian_data, (uint32_t*)work[i].data, 80);
+					uint32_t vtime = swab32(work[i].data[17]);
+					uint32_t vkey = vtime - vtime % 864000;
+					/* Use LE nonce (FPGA nonce is LE uint32) */
+					endian_data[19] = nonce;
+					odohash(vhash, endian_data, vkey);
+					applog(LOG_DEBUG, "ODO_VERIFY: nonce=%08X fpga_h7=%08X host_h7=%08X %s",
+						nonce, hash7, vhash[7],
+						vhash[7] == hash7 ? "*** MATCH ***" : "MISMATCH");
+				}
+
+				// HOST-SIDE SHARE CHECK: check readback nonce against pool target
+				if ((opt_algo == ALGO_BLAKE3 || opt_algo == ALGO_ODO) && count > 2) {
+					work[i].data[g_nonce_word_index] = nonce;
+					uint32_t check_hash[8];
+					calc_hash((unsigned char *)work[i].data, (unsigned char *)check_hash);
+					/* Debug: show hash for diff 0.01 check */
+					if (opt_algo == ALGO_ODO && count == 4 && i == 0) {
+						uint32_t *tgt = (uint32_t*)work[i].target;
+						applog(LOG_DEBUG, "ODO_CHECK: nonce=%08X hash7=%08X target7=%08X %s",
+							nonce, check_hash[7], tgt[7],
+							fulltest(check_hash, work[i].target) ? "PASS" : "FAIL");
+					}
+					if (fulltest(check_hash, work[i].target)) {
+						applog(LOG_WARNING, "%s-%d: HOST FOUND SHARE! Nonce=%08X hash7=%08X",
+							fpga->short_name, i, nonce, check_hash[7]);
+						ztex_stats[i].submitted++;
+						submit_work(mythr, &work[i]);
+					}
+				}
+
+				work[i].data[g_nonce_word_index] = nonce;
+				/* DATA CONSISTENCY CHECK: recompute hash from saved send buffer */
+				if (count == 3 && i == 0 && opt_algo == ALGO_BLAKE3) {
+					extern void blake3_compress_host(const uint32_t cv[8],
+						const uint32_t block_words[16], uint64_t counter,
+						uint32_t block_len, uint32_t flags, uint32_t out[8]);
+					extern unsigned char g_saved_send[4][84];
+					/* Recompute from saved send_buf (what FPGA actually received) */
+					uint32_t *sb32 = (uint32_t*)g_saved_send[i];
+					uint32_t scv[8], sb2[16] = {0}, sout[8];
+					for (int w=0; w<8; w++) scv[w] = sb32[w]; /* CV from send buf */
+					for (int w=0; w<3; w++) sb2[w] = sb32[8+w]; /* b2_low */
+					sb2[3] = nonce; /* nonce from FPGA */
+					for (int w=0; w<9; w++) sb2[4+w] = sb32[11+w]; /* b2_high */
+					blake3_compress_host(scv, sb2, 0, 52, 2|8, sout);
+					/* Also compute from work.data for comparison */
+					uint32_t *wd = (uint32_t*)work[i].data;
+					uint32_t vhash[8];
+					blake3_hash_180((void*)wd, (void*)vhash);
+					applog(LOG_DEBUG, "VERIFY: send_cv0=%08X work_hash7=%08X sendbuf_hash7=%08X fpga=%08X nonce=%08X",
+						scv[0], vhash[7], sout[7], hash7, nonce);
+					if (sout[7] == hash7)
+						applog(LOG_DEBUG, "VERIFY: *** SENDBUF HASH MATCHES FPGA! ***");
+				}
+				if (0 && ztex_checkNonce((unsigned char*)work[i].data) != hash7) {
+					if (count > 2) {
 						hw_errors[i]++;
 						ztex_stats[i].hw_errors++;
 						applog(LOG_DEBUG, "%s%d: Check Nonce Failed - Nonce: %08X, Hash: %08X, Expected: %08X", fpga->short_name, i, nonce, ztex_checkNonce((unsigned char*)work[i].data), hash7);
 					}
+					/* BYTE ORDER DIAGNOSTIC: try different interpretations */
+					if (count == 3 && i == 0 && opt_algo == ALGO_BLAKE3) {
+						extern void blake3_compress_host(const uint32_t cv[8],
+							const uint32_t block_words[16], uint64_t counter,
+							uint32_t block_len, uint32_t flags, uint32_t out[8]);
+						/* Print the send_buf bytes */
+						unsigned char *b = send_buf;
+						applog(LOG_DEBUG, "SENDBUF[0..15]: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+							b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+						applog(LOG_DEBUG, "SENDBUF[16..31]: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+							b[16],b[17],b[18],b[19],b[20],b[21],b[22],b[23],b[24],b[25],b[26],b[27],b[28],b[29],b[30],b[31]);
+						/* Try: FPGA sees words as swab32 of what we sent */
+						uint32_t *sw = (uint32_t*)send_buf;
+						uint32_t tcv[8], tb2[16], th[8];
+						/* Interpretation A: FPGA words = send words (no swap) */
+						for (int w=0;w<8;w++) tcv[w]=sw[w];
+						tb2[0]=sw[8]; tb2[1]=sw[9]; tb2[2]=sw[10]; tb2[3]=nonce;
+						for (int w=4;w<13;w++) tb2[w]=sw[w+7];
+						tb2[13]=tb2[14]=tb2[15]=0;
+						blake3_compress_host(tcv,tb2,0,52,2|8,th);
+						applog(LOG_DEBUG, "InterpA(raw): hash7=%08X fpga=%08X %s", th[7], hash7, th[7]==hash7?"MATCH":"");
+						/* Interpretation B: FPGA words = swab32 of send words */
+						for (int w=0;w<8;w++) tcv[w]=swab32(sw[w]);
+						tb2[0]=swab32(sw[8]); tb2[1]=swab32(sw[9]); tb2[2]=swab32(sw[10]); tb2[3]=nonce;
+						for (int w=4;w<13;w++) tb2[w]=swab32(sw[w+7]);
+						tb2[13]=tb2[14]=tb2[15]=0;
+						blake3_compress_host(tcv,tb2,0,52,2|8,th);
+						applog(LOG_DEBUG, "InterpB(swab): hash7=%08X fpga=%08X %s", th[7], hash7, th[7]==hash7?"MATCH":"");
+						/* Interpretation C: FPGA sees reversed word order */
+						for (int w=0;w<8;w++) tcv[w]=sw[20-w];
+						tb2[0]=sw[12]; tb2[1]=sw[11]; tb2[2]=sw[10]; tb2[3]=nonce;
+						for (int w=4;w<13;w++) tb2[w]=sw[16-w];
+						tb2[13]=tb2[14]=tb2[15]=0;
+						blake3_compress_host(tcv,tb2,0,52,2|8,th);
+						applog(LOG_DEBUG, "InterpC(rev_word): hash7=%08X fpga=%08X %s", th[7], hash7, th[7]==hash7?"MATCH":"");
+						/* Interpretation D: reversed word order + swab32 */
+						for (int w=0;w<8;w++) tcv[w]=swab32(sw[20-w]);
+						tb2[0]=swab32(sw[12]); tb2[1]=swab32(sw[11]); tb2[2]=swab32(sw[10]); tb2[3]=nonce;
+						for (int w=4;w<13;w++) tb2[w]=swab32(sw[16-w]);
+						tb2[13]=tb2[14]=tb2[15]=0;
+						blake3_compress_host(tcv,tb2,0,52,2|8,th);
+						applog(LOG_DEBUG, "InterpD(rev+swab): hash7=%08X fpga=%08X %s", th[7], hash7, th[7]==hash7?"MATCH":"");
+						/* Also try swapped nonce */
+						tb2[3]=swab32(nonce);
+						for (int w=0;w<8;w++) tcv[w]=sw[w];
+						tb2[0]=sw[8]; tb2[1]=sw[9]; tb2[2]=sw[10];
+						for (int w=4;w<13;w++) tb2[w]=sw[w+7];
+						tb2[13]=tb2[14]=tb2[15]=0;
+						blake3_compress_host(tcv,tb2,0,52,2|8,th);
+						applog(LOG_DEBUG, "InterpE(raw+swab_nonce): hash7=%08X fpga=%08X %s", th[7], hash7, th[7]==hash7?"MATCH":"");
+					}
 					continue;
 				}
 
+				// SHA3T cores scan their nonce space autonomously and reset the
+				// counter to 0 on every new work (work_valid), so the readback
+				// nonce is NOT monotonic across the scan. The host-range overflow
+				// check false-trips and would skip the FPGA for the rest of the
+				// scan, losing golden reads. Instead track the running MAX nonce
+				// (for the hashrate delta) and never latch overflow.
+				if (opt_algo == ALGO_SHA3T) {
+					if (nonce > last_nonce[i])
+						last_nonce[i] = nonce;
+				}
 				// Check If FPGA Has Processed All Nonces For The Work
-				if ( nonce < last_nonce[i] ) {
+				else if ( nonce < last_nonce[i] ) {
 					applog(LOG_DEBUG, "%s%d: Overflow - Nonce=%08X, Last=%08X", fpga->short_name, i, nonce, last_nonce[i]);
 					overflow[i] = true;
 					continue;
@@ -2929,11 +3331,37 @@ static void *ztex_miner_thread(void *userdata)
 						last_golden2[i] = last_golden1[i];
 						last_golden1[i] = golden[j];
 
-						work[i].data[19] = golden[j];
+						work[i].data[g_nonce_word_index] = golden[j];
 						calc_hash((unsigned char *)work[i].data, (unsigned char *)hash);
 					
+						// Log golden nonce hash for debugging
+						if (opt_algo == ALGO_ODO) {
+							extern unsigned char g_saved_send[4][84];
+							unsigned char *sb = g_saved_send[i];
+							/* Check if verify data matches what was sent */
+							unsigned char verify_buf[76];
+							swap_endian((uint32_t*)verify_buf, (uint32_t*)work[i].data, 76);
+							int mismatch = memcmp(sb, verify_buf, 76);
+							applog(LOG_DEBUG, "GOLDEN: nonce=%08X hash7=%08X target7=%08X %s fpga=%d DATA_%s",
+								golden[j], hash[7], target[7],
+								fulltest(hash, work[i].target) ? "PASS" : "FAIL", i,
+								mismatch ? "STALE!" : "OK");
+							applog(LOG_DEBUG, "  SEND[0-39]: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+								sb[0],sb[1],sb[2],sb[3],sb[4],sb[5],sb[6],sb[7],sb[8],sb[9],
+								sb[10],sb[11],sb[12],sb[13],sb[14],sb[15],sb[16],sb[17],sb[18],sb[19],
+								sb[20],sb[21],sb[22],sb[23],sb[24],sb[25],sb[26],sb[27],sb[28],sb[29],
+								sb[30],sb[31],sb[32],sb[33],sb[34],sb[35],sb[36],sb[37],sb[38],sb[39]);
+							applog(LOG_DEBUG, "  SEND[40-75]: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+								sb[40],sb[41],sb[42],sb[43],sb[44],sb[45],sb[46],sb[47],sb[48],sb[49],
+								sb[50],sb[51],sb[52],sb[53],sb[54],sb[55],sb[56],sb[57],sb[58],sb[59],
+								sb[60],sb[61],sb[62],sb[63],sb[64],sb[65],sb[66],sb[67],sb[68],sb[69],
+								sb[70],sb[71],sb[72],sb[73],sb[74],sb[75]);
+						} else if (opt_algo == ALGO_BLAKE3 && opt_debug && ztex_stats[i].submitted < 3) {
+							applog(LOG_DEBUG, "GOLDEN: nonce=%08X hash7=%08X hash6=%08X target7=%08X target6=%08X",
+								golden[j], hash[7], hash[6], target[7], target[6]);
+						}
 						// Check If Hash < Target Sent To FPGA
-						if (swab32(hash[7]) > swab32(target[7])) {
+						if (opt_algo != ALGO_BLAKE3 && opt_algo != ALGO_ODO && opt_algo != ALGO_SHA3T && swab32(hash[7]) > swab32(target[7])) {
 							fpga->hw_errors++;
 							applog(LOG_INFO, "%s-%d: HW Error (Nonce: %08x, Hash: %08X, Target: %08X)", fpga->short_name, i, golden[j], swab32(hash[7]), swab32(target[7]));
 							continue;
@@ -2941,17 +3369,16 @@ static void *ztex_miner_thread(void *userdata)
 					
 						// Check If Hash < Work Target
 						if(fulltest(hash, work[i].target)) {
-							applog(LOG_DEBUG, "%s-%d: Submit Nonce - %08X (%1.1fMhz)", fpga->short_name, i, golden[j], ztex_stats[i].hashrate/1000000.0);
+							applog(LOG_WARNING, "%s-%d: Submit Nonce - %08X (hash7=%08X)", fpga->short_name, i, golden[j], hash[7]);
 							ztex_stats[i].submitted++;
 							submit_work(mythr, &work[i]);
-
-							// Check If Block Was Found
 							if(fulltest(hash, work[i].block_target)) {
 								applog(LOG_NOTICE, "%s-%d: %s***** BLOCK FOUND *****", fpga->short_name, i, CL_GRN);
 								g_block_count++;
 							}
-						}
-						else {
+						} else {
+							// hash7 met the FPGA threshold but full 256-bit target
+							// not met: legitimate near-miss, NOT an error.
 							applog(LOG_DEBUG, "%s-%d: Share Above Target - %08X (%1.1f MH/s)", fpga->short_name, i, golden[j], ztex_stats[i].hashrate/1000000.0);
 						}
 					}
@@ -2962,17 +3389,50 @@ static void *ztex_miner_thread(void *userdata)
 			gettimeofday(&tv_end, NULL);
 			timeval_subtract(&elapsed, &tv_end, &tv_start);
 
-			// Calculate Hashrates
-			fpga->hashrate = 0.0;
-			for (i=0; i < num_fpgas; i++) {
-				ztex_stats[i].hashrate = (double)last_nonce[i] / ((double)(elapsed.tv_sec) + ((double)(elapsed.tv_usec))/((double)1000000));
-				fpga->hashrate += ztex_stats[i].hashrate;
+			// Calculate Hashrates using delta from work-item start
+			// (FPGA nonce counter may not reset on new block, so we compute
+			// the growth since work-start rather than using the absolute value)
+			{
+				double elapsed_secs = (double)(elapsed.tv_sec) + ((double)(elapsed.tv_usec))/((double)1000000);
+				if (elapsed_secs >= 2.0) {
+					fpga->hashrate = 0.0;
+					for (i=0; i < num_fpgas; i++) {
+						uint32_t delta = last_nonce[i] - start_nonce[i];
+						ztex_stats[i].hashrate = (double)delta / elapsed_secs;
+						fpga->hashrate += ztex_stats[i].hashrate;
+					}
+				}
 			}
 
 			pthread_mutex_lock(&stats_lock);
 			thr_hashrates[thr_id] = fpga->hashrate;
 			pthread_mutex_unlock(&stats_lock);
-			
+
+			// Always-on HW heartbeat (for the freq supervisor to parse).
+			// One line per ~30s: per-FPGA MH/s and cumulative HW errors.
+			{
+				static time_t last_hb = 0;
+				time_t nowt = time(NULL);
+				if (nowt - last_hb >= 30) {
+					last_hb = nowt;
+					double board_mhps = 0.0; int board_active = 0;
+					for (i=0; i < num_fpgas; i++) {
+						if (!ztex_stats[i].enabled) continue;
+						double mhps = ztex_stats[i].hashrate/1000000.0;
+						double wmh = (mhps > 0.01) ? (opt_watts_per_fpga / mhps) : 0.0;
+						applog(LOG_WARNING, "HEARTBEAT %s%d %.2f MH/s %.1fW %.3f W/MHs HWtotal=%u",
+							fpga->short_name, i, mhps, opt_watts_per_fpga, wmh, ztex_stats[i].hw_errors);
+						board_mhps += mhps; board_active++;
+					}
+					if (board_active > 0) {
+						double board_w = board_active * opt_watts_per_fpga;
+						double board_wmh = (board_mhps > 0.01) ? (board_w / board_mhps) : 0.0;
+						applog(LOG_WARNING, "BOARD %s %d fpgas %.2f MH/s %.1fW %.3f W/MHs",
+							fpga->name, board_active, board_mhps, board_w, board_wmh);
+					}
+				}
+			}
+
 			if (elapsed.tv_sec >= fpga->timeout) {
 				applog(LOG_DEBUG, "%s: End Scan For Nonces - Time = %d sec", fpga->short_name, elapsed.tv_sec);
 				break;
@@ -3005,7 +3465,9 @@ static void *ztex_miner_thread(void *userdata)
 				}
 				
 				// Decrease Frequency If More Than 1 Error In Last 2 Minutes
-				if(ztex_stats[i].freq_check_errors > 1) {
+				// (only when auto-freq is explicitly enabled — otherwise a
+				// transient error must never silently downclock the board)
+				if(opt_auto_freq && ztex_stats[i].freq_check_errors > 1) {
 					if(!ztex_stats[i].max_freq_found) {
 						ztex_stats[i].max_freq_found = true;
 						ztex_stats[i].hw_errors = 0;
@@ -3220,10 +3682,22 @@ int main(int argc, char *argv[]) {
 		case ALGO_VCASH:
 			g_fpga_use_midstate = true;
 			g_fpga_work_len = 44;
+			g_nonce_word_index = 19;
+			break;
+		case ALGO_BLAKE3:
+			g_fpga_use_midstate = false;
+			g_fpga_work_len = 84;
+			g_nonce_word_index = 35;
+			break;
+		case ALGO_ODO:
+			g_fpga_use_midstate = false;
+			g_fpga_work_len = 76;  // 80-byte header minus 4-byte nonce
+			g_nonce_word_index = 19;  // standard nonce position
 			break;
 		default:
 			g_fpga_use_midstate = false;
 			g_fpga_work_len = 80;
+			g_nonce_word_index = 19;
 	}
 	
 	if (!rpc_url) {
@@ -3283,15 +3757,21 @@ if (opt_priority > 0) {
 		affine_to_cpu_mask(-1, opt_affinity);
 	}
 
-	work_restart = (struct work_restart*) calloc(g_miner_count, sizeof(*work_restart));
+	/* One thread per CPU worker AND per FPGA board (serial + ztex), plus 4
+	 * service threads (work/longpoll/stratum/api) + 1 slack. Previously sized
+	 * to only (g_miner_count + 5), which overflowed with >1 ZTEX board since
+	 * one ztex_miner_thread is spawned per board. */
+	int n_alloc_threads = g_miner_count + g_serial_fpga_count + g_ztex_fpga_count + 5;
+
+	work_restart = (struct work_restart*) calloc(n_alloc_threads, sizeof(*work_restart));
 	if (!work_restart)
 		return 1;
 
-	thr_info = (struct thr_info*) calloc(g_miner_count + 5, sizeof(*thr));
+	thr_info = (struct thr_info*) calloc(n_alloc_threads, sizeof(*thr));
 	if (!thr_info)
 		return 1;
 
-	thr_hashrates = (double *) calloc(g_miner_count, sizeof(double));
+	thr_hashrates = (double *) calloc(n_alloc_threads, sizeof(double));
 	if (!thr_hashrates)
 		return 1;
 
@@ -3362,8 +3842,12 @@ if (opt_priority > 0) {
 
 	applog(LOG_INFO, "Attempting to start %d miner threads using '%s' algorithm", g_miner_count, algo_names[opt_algo]);
 	thr_idx = 0;
-	
+
 	// Start CPU Mining Threads
+	// NOTE: CPU threads occupy ids [0 .. g_miner_count-1]; the 4 service threads
+	// occupy [g_miner_count .. g_miner_count+3]. Device (serial/ztex) threads must
+	// therefore start at g_miner_count+4 to avoid aliasing the service threads
+	// (critical once >1 board is present). See device-thread section below.
 	if (opt_use_cpu) {
 		for (i = 0; i < opt_n_threads; i++) {
 			thr = &thr_info[thr_idx];
@@ -3381,6 +3865,10 @@ if (opt_priority > 0) {
 		}
 		applog(LOG_INFO, "\t%d CPU miner threads started.", opt_n_threads);
 	}
+
+	// Device threads (serial/ztex) start AFTER the 4 service threads so their
+	// ids never alias work/longpoll/stratum/api (which sit at g_miner_count+0..3).
+	thr_idx = g_miner_count + 4;
 
 	// Start Serial FPGA Mining Threads
 	if (opt_use_serial) {

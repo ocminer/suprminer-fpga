@@ -285,6 +285,9 @@ static bool libztex_getConfigured(struct libztex_device *ztex)
 }
 
 
+// Forward declaration for LS fallback
+bool libztex_configureFpgaLS(struct libztex_device *ztex, const char* bitstream);
+
 bool libztex_configureFpga(struct libztex_device *ztex, const char* bitstream)
 {
 	const int transactionBytes = 65536;
@@ -306,7 +309,7 @@ bool libztex_configureFpga(struct libztex_device *ztex, const char* bitstream)
 
 	rc = libusb_claim_interface(ztex->hndl, settings[1]);
 	if (rc != LIBUSB_SUCCESS) {
-		applog(LOG_ERR, "%s: Unable to claim tnterface for HS transfer (Error: %d)", ztex->repr, rc);
+		applog(LOG_ERR, "%s: Unable to claim interface for HS transfer (Error: %d)", ztex->repr, rc);
 		return false;
 	}
 
@@ -318,12 +321,11 @@ bool libztex_configureFpga(struct libztex_device *ztex, const char* bitstream)
 			return false;
 		}
 
-		// Initialize HS Configuration
+		// Initialize HS Configuration (resets the selected FPGA + sets up GPIF)
 		libusb_control_transfer(ztex->hndl, 0x40, 0x34, 0, 0, NULL, 0, 1000);
 
 		do	{
-
-			length = fread(buf,1,transactionBytes,fp);
+			length = fread(buf, 1, transactionBytes, fp);
 
 			if (bs != 0 && bs != 1)
 				bs = libztex_detectBitstreamBitOrder(buf, length);
@@ -334,29 +336,78 @@ bool libztex_configureFpga(struct libztex_device *ztex, const char* bitstream)
 			if (cnt != length)
 				applog(LOG_ERR, "%s: Only able to send %u of %u bitstream bytes", ztex->repr, cnt, length);
 			if (rc != 0)
-				applog(LOG_ERR, "%s: Unable to send HS FPGA data", ztex->repr);
-
+				applog(LOG_ERR, "%s: Unable to send HS FPGA data (err=%d)", ztex->repr, rc);
 		} while (!feof(fp));
 
-		// Finish HS Configuration
+		// Finish HS Configuration (sends 255 extra CCLK cycles for startup)
 		libusb_control_transfer(ztex->hndl, 0x40, 0x35, 0, 0, NULL, 0, 1000);
 
-		if (cnt >= 0)
-			tries = 0;
+		if (cnt >= 0) tries = 0;  // Data sent OK, exit retry loop
 
 		fclose(fp);
-
-		if (!libztex_getConfigured(ztex)) {
-			applog(LOG_ERR, "%s: HS FPGA configuration failed: DONE pin does not go high", ztex->repr);
-			libusb_release_interface(ztex->hndl, settings[1]);
-			return false;
-		}
-
 	}
 
 	libusb_release_interface(ztex->hndl, settings[1]);
 
-	return true;
+	// Wait for DONE pin after releasing interface
+	usleep(200000);
+
+	if (libztex_getConfigured(ztex))
+		return true;
+
+	applog(LOG_ERR, "%s: HS FPGA configuration failed, trying LS fallback", ztex->repr);
+	return libztex_configureFpgaLS(ztex, bitstream);
+}
+
+// Low-speed FPGA configuration fallback (via EP0 control transfers)
+bool libztex_configureFpgaLS(struct libztex_device *ztex, const char* bitstream)
+{
+	const int transactionBytes = 2048;
+	unsigned char buf[transactionBytes];
+	int tries, cnt, length;
+	char bs = -1;
+	FILE *fp;
+
+	applog(LOG_WARNING, "%s: Trying low-speed FPGA configuration for FPGA %d...", ztex->repr, ztex->fpgaNum);
+
+	for (tries = 10; tries > 0; tries--) {
+		fp = open_bitstream(bitstream);
+		if (!fp) return false;
+
+		// Re-select FPGA, reset it, and wait for INIT_B
+		libusb_control_transfer(ztex->hndl, 0x40, 0x51, (uint16_t)ztex->fpgaNum, 0, NULL, 0, 500);
+		usleep(50000);  // 50ms settle after select
+		libusb_control_transfer(ztex->hndl, 0x40, 0x31, 0, 0, NULL, 0, 1000);
+		usleep(50000);  // 50ms for INIT_B to rise
+
+		do {
+			length = fread(buf, 1, transactionBytes, fp);
+			if (bs != 0 && bs != 1)
+				bs = libztex_detectBitstreamBitOrder(buf, length);
+			if (bs == 1)
+				libztex_swapBits(buf, length);
+			cnt = libusb_control_transfer(ztex->hndl, 0x40, 0x32, 0, 0, buf, length, 5000);
+			if (cnt != length) {
+				applog(LOG_ERR, "%s: LS config: sent %d of %d bytes", ztex->repr, cnt, length);
+				break;
+			}
+		} while (!feof(fp));
+
+		fclose(fp);
+
+		usleep(200000);
+
+		if (libztex_getConfigured(ztex)) {
+			applog(LOG_WARNING, "%s: LS FPGA configuration succeeded! (try %d)", ztex->repr, 11-tries);
+			return true;
+		}
+
+		if (cnt > 0)
+			applog(LOG_WARNING, "%s: LS config try %d: data sent OK but DONE not high", ztex->repr, 11-tries);
+	}
+
+	applog(LOG_ERR, "%s: LS FPGA configuration failed after 10 tries", ztex->repr);
+	return false;
 }
 
 int libztex_numberOfFpgas(struct libztex_device *ztex)
@@ -619,7 +670,10 @@ int libztex_sendData(struct libztex_device *ztex, unsigned char *sendbuf, int le
 		return 0;
 
 	while (len > 0) {
-		cnt = libusb_control_transfer(ztex->hndl, 0x40, 0x80, 0, 0, sendbuf + idx, len, 1000);
+		/* FX2 EP0 buffer is 64 bytes; split large transfers.
+		 * The FPGA's byte counter handles multi-packet work data. */
+		int chunk = (len > 64) ? 64 : len;
+		cnt = libusb_control_transfer(ztex->hndl, 0x40, 0x80, 0, 0, sendbuf + idx, chunk, 2000);
 		if (cnt >= 0) {
 			len -= cnt;
 			idx += cnt;

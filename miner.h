@@ -360,7 +360,7 @@ void get_currentalgo(char* buf, int sz);
 bool has_aes_ni(void);
 
 struct work {
-	uint32_t data[32];
+	uint32_t data[48];  /* 48 words = 192 bytes, enough for Decred 180-byte header */
 	uint32_t target[8];
 	uint32_t block_target[8];
 
@@ -465,6 +465,9 @@ void format_hashrate(double hashrate, char *output);
 void print_hash_tests(void);
 
 void groestlhash(void *output, const void *input);
+void sha3256t_hash(void *output, const void *input);
+int scanhash_sha3t(int thr_id, uint32_t *pdata, const uint32_t *ptarget, uint32_t max_nonce, uint64_t *hashes_done);
+void blake3_hash_180(const void *input, void *output);
 int scanhash_groestl(int thr_id, uint32_t *pdata, const uint32_t *ptarget, uint32_t max_nonce, uint64_t *hashes_done);
 
 void myriadhash(void *output, const void *input);

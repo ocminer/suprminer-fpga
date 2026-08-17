@@ -1597,7 +1597,18 @@ static uint32_t getblocheight(struct stratum_ctx *sctx)
 	uint32_t height = 0;
 	uint8_t hlen = 0, *p, *m;
 
-	// find 0xffff tag
+	/* Decred/BLAKE3: height is at header offset 128.
+	 * coinbase = genTx1 = header[36:180], so height = coinbase[92:96] */
+	if (sctx->job.coinbase_size >= 96) {
+		/* Check if this looks like a Decred genTx1 (144 bytes) */
+		if (sctx->job.coinbase_size >= 144) {
+			height = le32dec(sctx->job.coinbase + 92);
+			if (height > 0 && height < 100000000)
+				return height;
+		}
+	}
+
+	// Bitcoin-style: find 0xffff tag in coinbase
 	p = (uint8_t*) sctx->job.coinbase + 32;
 	m = p + 128;
 	while (*p != 0xff && p < m) p++;
