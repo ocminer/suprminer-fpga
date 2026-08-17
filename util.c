@@ -41,6 +41,7 @@
 #endif
 
 #include "miner.h"
+#include "tui.h"
 #include "elist.h"
 
 extern pthread_mutex_t stats_lock;
@@ -141,21 +142,32 @@ void applog(int prio, const char *fmt, ...)
 		if (!use_colors)
 			color = "";
 
-		len = 64 + (int) strlen(fmt) + 2;
-		f = (char*) malloc(len);
-		sprintf(f, "[%02d:%02d:%02d]%s %s%s\n",
-			tm.tm_hour,
-			tm.tm_min,
-			tm.tm_sec,
-			color,
-			fmt,
-			use_colors ? CL_N : ""
-		);
-		pthread_mutex_lock(&applog_lock);
-		vfprintf(stdout, f, ap);	/* atomic write to stdout */
-		fflush(stdout);
-		free(f);
-		pthread_mutex_unlock(&applog_lock);
+		if (opt_tui) {
+			/* Route into the TUI log ring buffer (+ --log-file) instead of the
+			 * terminal, which ncurses owns. Expand the message with no color. */
+			char msg[512];
+			va_list ap2;
+			va_copy(ap2, ap);
+			vsnprintf(msg, sizeof(msg), fmt, ap2);
+			va_end(ap2);
+			tui_log(prio, msg);
+		} else {
+			len = 64 + (int) strlen(fmt) + 2;
+			f = (char*) malloc(len);
+			sprintf(f, "[%02d:%02d:%02d]%s %s%s\n",
+				tm.tm_hour,
+				tm.tm_min,
+				tm.tm_sec,
+				color,
+				fmt,
+				use_colors ? CL_N : ""
+			);
+			pthread_mutex_lock(&applog_lock);
+			vfprintf(stdout, f, ap);	/* atomic write to stdout */
+			fflush(stdout);
+			free(f);
+			pthread_mutex_unlock(&applog_lock);
+		}
 	}
 	va_end(ap);
 }

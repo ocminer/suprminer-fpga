@@ -49,6 +49,7 @@ set(SRC_LIST fpga-miner.c
 		api.c
 		fpgautils.c
 		libztex.c
+		tui.c
 		util.c
 		./algo/blake256-8.c
 		./algo/groestl.c
@@ -72,7 +73,7 @@ ELSE ( WIN32 )
 	add_executable(${TARGET_NAME} ${SRC_LIST})
 ENDIF ( WIN32 )
 
-target_link_libraries(${TARGET_NAME} pthread ${CURL_LIBRARIES} ${LIBUSB_LIBRARIES} jansson)
+target_link_libraries(${TARGET_NAME} pthread ${CURL_LIBRARIES} ${LIBUSB_LIBRARIES} jansson ncurses)
 
 IF(WIN32)
 	target_link_libraries(${TARGET_NAME} Ws2_32)

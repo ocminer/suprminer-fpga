@@ -46,6 +46,7 @@
 #endif
 
 #include "miner.h"
+#include "tui.h"
 #include "algo/blake3.h"
 
 #ifdef WIN32
@@ -152,6 +153,20 @@ pthread_mutex_t stats_lock;
 uint32_t accepted_count = 0L;
 uint32_t rejected_count = 0L;
 double *thr_hashrates;
+
+/* Hash-clock of the currently deployed bitstream, MHz (shown in the TUI). */
+double g_hash_clock_mhz = 90.0;
+
+/* Per-share submit-id -> originating device, for TUI per-FPGA attribution.
+ * Stratum responses carry only the JSON-RPC id, so we map id -> (board,fpga).
+ * submit_upstream_work runs single-threaded in the workio thread. */
+#define SUBMIT_MAP_SZ 512
+static int g_submit_board[SUBMIT_MAP_SZ];
+static int g_submit_fpga[SUBMIT_MAP_SZ];
+static unsigned g_submit_id = 4;   /* ids 1..3 reserved (subscribe/auth/etc.) */
+
+/* TUI accessor — algo_names[]/opt_algo are static to this file. */
+const char *tui_algo_name(void) { return algo_names[opt_algo]; }
 uint64_t global_hashrate = 0;
 double stratum_diff = 0.;
 double net_diff = 0.;
@@ -300,6 +315,9 @@ static struct option const options[] = {
 	{ "ztex", 1, NULL, 'z' },
 	{ "auto-freq", 0, NULL, 1004 },
 	{ "watts-per-fpga", 1, NULL, 1008 },
+	{ "tui", 0, NULL, 1040 },
+	{ "log-file", 1, NULL, 1041 },
+	{ "hash-clock", 1, NULL, 1042 },
 	{ "firmware", 0, NULL, 'F' },
 	{ "version", 0, NULL, 'V' },
 	{ 0, 0, 0, 0 }
@@ -854,9 +872,15 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 					work->job_id, noncestr, ntimestr, work->data[19]);
 			}
 			xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
+			/* Unique per-submit id so the async stratum response can be mapped
+			 * back to the originating FPGA (id must stay >= 4). */
+			unsigned sid = g_submit_id++;
+			int slot = sid % SUBMIT_MAP_SZ;
+			g_submit_board[slot] = work->dev_board;
+			g_submit_fpga[slot]  = work->dev_fpga;
 			snprintf(s, JSON_BUF_LEN,
-					"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
-					rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
+					"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":%u}",
+					rpc_user, work->job_id, xnonce2str, ntimestr, noncestr, sid);
 			free(xnonce2str);
 		}
 
@@ -1875,6 +1899,19 @@ static bool stratum_handle_response(char *buf)
 			goto out;
 		valid = json_is_true(res_val);
 		share_result(valid, NULL, err_val ? json_string_value(json_array_get(err_val, 1)) : NULL);
+
+		/* Attribute this share back to the FPGA that produced it (TUI). */
+		{
+			int sid = (int) json_integer_value(id_val);
+			int slot = ((sid % SUBMIT_MAP_SZ) + SUBMIT_MAP_SZ) % SUBMIT_MAP_SZ;
+			int b = g_submit_board[slot], fp = g_submit_fpga[slot];
+			if (b >= 0) {
+				const char *bn = tui_board_name(b);
+				tui_record_share(b, fp, valid);
+				applog(LOG_NOTICE, "Share from %s FPGA %d %s",
+					bn ? bn : "?", fp, valid ? "ACCEPTED" : "REJECTED");
+			}
+		}
 	}
 
 	ret = true;
@@ -2298,6 +2335,17 @@ void parse_arg(int key, char *arg)
 		opt_watts_per_fpga = atof(arg);
 		if (opt_watts_per_fpga <= 0) opt_watts_per_fpga = 7.5;
 		break;
+	case 1040:			/* --tui */
+		opt_tui = true;
+		break;
+	case 1041:			/* --log-file PATH */
+		free(opt_log_file);
+		opt_log_file = strdup(arg);
+		break;
+	case 1042:			/* --hash-clock MHZ (display only) */
+		g_hash_clock_mhz = atof(arg);
+		if (g_hash_clock_mhz <= 0) g_hash_clock_mhz = 90.0;
+		break;
 	case 1007:
 		want_stratum = false;
 		opt_extranonce = false;
@@ -2636,11 +2684,15 @@ static bool initialize_ztex_miner(void *thr, int ztex_num)
 	
 	memcpy(fpga->name, ztex_info[ztex_num].repr, 20);
 	strcpy(fpga->short_name, short_name);
+	fpga->board_idx = ztex_num;
 	fpga->type = FPGA_ZTEX;
 	fpga->timeout = opt_scantime;
 	fpga->ztex_info = &ztex_info[ztex_num];
 
 	fpga->ztex_stats = (struct ztex_stats *) calloc(ztex_info[ztex_num].numberOfFpgas, sizeof(struct ztex_stats));
+
+	/* Register with the TUI so the dashboard can read this board's stats. */
+	tui_register_board(ztex_num, fpga);
 	
 	for(i=0; i<ztex_info[ztex_num].numberOfFpgas; i++) {
 		{
@@ -2960,7 +3012,8 @@ static void *ztex_miner_thread(void *userdata)
 		applog(LOG_ERR, "calloc failed");
 		return;
 	}
-	
+	for (i = 0; i < num_fpgas; i++) { work[i].dev_board = -1; work[i].dev_fpga = -1; }
+
 	while (1) {
 		
 		// Send Data To Be Hashed To Each Chip On FPGA
@@ -3220,6 +3273,8 @@ static void *ztex_miner_thread(void *userdata)
 						applog(LOG_WARNING, "%s-%d: HOST FOUND SHARE! Nonce=%08X hash7=%08X",
 							fpga->short_name, i, nonce, check_hash[7]);
 						ztex_stats[i].submitted++;
+						work[i].dev_board = fpga->board_idx;  /* for per-FPGA A/R attribution */
+						work[i].dev_fpga = i;
 						submit_work(mythr, &work[i]);
 					}
 				}
@@ -3375,6 +3430,8 @@ static void *ztex_miner_thread(void *userdata)
 						if(fulltest(hash, work[i].target)) {
 							applog(LOG_WARNING, "%s-%d: Submit Nonce - %08X (hash7=%08X)", fpga->short_name, i, golden[j], hash[7]);
 							ztex_stats[i].submitted++;
+							work[i].dev_board = fpga->board_idx;  /* for per-FPGA A/R attribution */
+							work[i].dev_fpga = i;
 							submit_work(mythr, &work[i]);
 							if(fulltest(hash, work[i].block_target)) {
 								applog(LOG_NOTICE, "%s-%d: %s***** BLOCK FOUND *****", fpga->short_name, i, CL_GRN);
@@ -3692,7 +3749,20 @@ int main(int argc, char *argv[]) {
 	if (!opt_n_threads)
 		opt_n_threads = 1;
 
-	
+#ifndef WIN32
+	if (opt_tui && !isatty(STDOUT_FILENO)) {
+		applog(LOG_WARNING, "--tui requires a terminal; disabling TUI");
+		opt_tui = false;
+	}
+#endif
+	if (opt_tui) {
+		pthread_t tui_pth;
+		tui_init();   /* takes over the terminal; applog now routes to the log pane */
+		pthread_create(&tui_pth, NULL, tui_thread, NULL);
+		pthread_detach(tui_pth);
+	}
+
+
 	if(!opt_use_cpu)
 		g_miner_count = 0;
 	else

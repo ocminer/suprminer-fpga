@@ -199,6 +199,9 @@ struct ztex_stats {
 	int hr_count;
 	int submitted;
 	int hw_errors;
+	int accepted;                  /* per-FPGA accepted shares (for TUI) */
+	int rejected;                  /* per-FPGA rejected shares (for TUI) */
+	struct timeval last_share_tv;  /* time of last accepted/rejected share */
 	int freq_check_errors;
 	struct timeval freq_check_tv;
 	bool max_freq_found;
@@ -207,6 +210,7 @@ struct ztex_stats {
 struct fpga_info {
 	char name[20];
 	char short_name[10];
+	int board_idx;      /* index into ztex_info[] / TUI registry */
 	int type;
 	char * device_path;
 	int device_fd;
@@ -375,6 +379,9 @@ struct work {
 	char *job_id;
 	size_t xnonce2_len;
 	unsigned char *xnonce2;
+
+	int dev_board;   /* originating board index, or -1 (CPU/unknown) */
+	int dev_fpga;    /* originating FPGA index within the board */
 };
 
 struct thr_info {
