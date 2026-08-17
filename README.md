@@ -1,4 +1,4 @@
-# FPGA Miner — BLAKE3 Decred / Groestl / Blake256
+# suprminer-fpga — SHA3-256t (BC3) / Groestl / BLAKE3 Decred FPGA miner
 
 FPGA mining software for ZTEX USB-FPGA Module 1.15y boards.
 Supports Groestl, Myriad-Groestl, Blake256-8, and **BLAKE3 (Decred DCP-0011)**.

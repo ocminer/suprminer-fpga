@@ -1,7 +1,7 @@
 #ifndef __MINER_H__
 #define __MINER_H__
 
-#define PACKAGE_NAME "fpga_miner"
+#define PACKAGE_NAME "suprminer-fpga"
 #define PACKAGE_VERSION "1.0.0"
 
 #define USER_AGENT PACKAGE_NAME "/" PACKAGE_VERSION

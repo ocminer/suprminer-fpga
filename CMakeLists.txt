@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 2.8)
 
-project(fpga_miner C CXX)
+project(suprminer-fpga C CXX)
 
 
 # Confirm LIBUSB Has Been Installed
@@ -64,7 +64,7 @@ set(SRC_LIST fpga-miner.c
 		./algo/KeccakP-800-reference.c
 	)
 			
-set(TARGET_NAME fpga_miner)
+set(TARGET_NAME suprminer-fpga)
 
 IF ( WIN32 )
 	add_executable(${TARGET_NAME} ${SRC_LIST} ./compat/winansi.c)

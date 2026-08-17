@@ -22,6 +22,7 @@ xst/
 
 # Compiled binaries / scratch
 fpga_miner
+suprminer-fpga
 fpga_miner_arm
 hash_test
 byte_order_test
