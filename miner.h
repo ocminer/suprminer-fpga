@@ -199,6 +199,7 @@ struct ztex_stats {
 	int hr_count;
 	int submitted;
 	int hw_errors;
+	int readback_resync;           /* shared-bus zero-readback resyncs (silent share-loss fix) */
 	int accepted;                  /* per-FPGA accepted shares (for TUI) */
 	int rejected;                  /* per-FPGA rejected shares (for TUI) */
 	struct timeval last_share_tv;  /* time of last accepted/rejected share */

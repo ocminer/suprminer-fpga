@@ -3217,6 +3217,48 @@ static void *ztex_miner_thread(void *userdata)
 				// Read Results From FPGA
 				libztex_selectFpga(ztex, i);
 				rc = libztex_readData(ztex, &nonce, &hash7, golden);
+
+				/* Shared-bus readback DESYNC fix: a read can silently return
+				 * all-zeros while the FPGA is provably hashing (nonce was
+				 * already deep into the range). golden==0 is skipped silently
+				 * by the dedup logic below, so every desynced poll throws away
+				 * latched shares -- this was worth a 3-4x pool hashrate loss.
+				 * Detect (nonce==0 after real progress), re-select to resync
+				 * the FX2 read pointer, and re-read. Goldens are latched on
+				 * the FPGA so one clean read recovers them. */
+				if (rc >= 0 && nonce == 0 && golden[0] == 0 && last_nonce[i] > 2000000) {
+					int rs;
+					for (rs = 0; rs < 3 && nonce == 0 && golden[0] == 0; rs++) {
+						ztex_stats[i].readback_resync++;
+						nmsleep(2);
+						libztex_selectFpga(ztex, i);
+						rc = libztex_readData(ztex, &nonce, &hash7, golden);
+						if (rc < 0) break;
+					}
+				}
+				/* Garbage-read guard (desync can also return junk, not just
+				 * zeros): the max legitimate nonce advance between polls is
+				 * ~5M (250ms @ 12MH/s) plus first-poll slack, so a jump of
+				 * >60M is bus corruption. Resync and re-read; if it persists,
+				 * skip this poll entirely so junk never poisons last_nonce
+				 * (hashrate spikes) or the golden dedup. */
+				if (rc >= 0 && opt_algo == ALGO_SHA3T &&
+				    nonce > last_nonce[i] && (nonce - last_nonce[i]) > 60000000) {
+					int rs;
+					for (rs = 0; rs < 3; rs++) {
+						ztex_stats[i].readback_resync++;
+						nmsleep(2);
+						libztex_selectFpga(ztex, i);
+						rc = libztex_readData(ztex, &nonce, &hash7, golden);
+						if (rc < 0) break;
+						if (nonce <= last_nonce[i] ||
+						    (nonce - last_nonce[i]) <= 60000000) break;
+					}
+					if (rc >= 0 && nonce > last_nonce[i] &&
+					    (nonce - last_nonce[i]) > 60000000)
+						continue;   /* still junk: drop this poll, keep FPGA enabled */
+				}
+
 				if (rc < 0) {
 					applog(LOG_ERR, "ERROR: Failed To Read Data From %s-%d (rc=%d), retrying...", fpga->short_name, i, rc);
 					nmsleep(500);
@@ -3511,8 +3553,9 @@ static void *ztex_miner_thread(void *userdata)
 						double mhps = ztex_stats[i].hashrate_smooth/1000000.0;
 						double wmh = (mhps > 0.01) ? (opt_watts_per_fpga / mhps) : 0.0;
 						double mhw = (opt_watts_per_fpga > 0.01) ? (mhps / opt_watts_per_fpga) : 0.0;
-						applog(LOG_WARNING, "HEARTBEAT %s%d %.2f MH/s %.1fW %.2f MH/s/W %.3f W/MHs HWtotal=%u",
-							fpga->short_name, i, mhps, opt_watts_per_fpga, mhw, wmh, ztex_stats[i].hw_errors);
+						applog(LOG_WARNING, "HEARTBEAT %s%d %.2f MH/s %.1fW %.2f MH/s/W %.3f W/MHs HWtotal=%u RS=%d",
+							fpga->short_name, i, mhps, opt_watts_per_fpga, mhw, wmh, ztex_stats[i].hw_errors,
+							ztex_stats[i].readback_resync);
 						board_mhps += mhps; board_active++;
 					}
 					if (board_active > 0) {
