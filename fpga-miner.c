@@ -2701,6 +2701,7 @@ static bool initialize_ztex_miner(void *thr, int ztex_num)
 		}
 		fpga->ztex_stats[i].hashrate = 0.0;
 		fpga->ztex_stats[i].freq = g_ztex_freq;
+		fpga->ztex_stats[i].gov_m = g_ztex_freq;   /* governor starts at --ztex M */
 		gettimeofday(&fpga->ztex_stats[i].freq_check_tv, NULL);
 	}
 
@@ -3214,11 +3215,23 @@ static void *ztex_miner_thread(void *userdata)
 				if(!ztex_stats[i].enabled || overflow[i])
 					continue;
 			
-				// Read Results From FPGA
+				// Read Results From FPGA. rc==-99 = short read (pointer
+				// desync signal from libztex) -> re-select resets the FPGA's
+				// read pointer, then retry. No prime reads, no stitching:
+				// extra bus traffic CREATES the contention that desyncs.
 				libztex_selectFpga(ztex, i);
 				rc = libztex_readData(ztex, &nonce, &hash7, golden);
+				{
+					int rr;
+					for (rr = 0; rr < 4 && rc == -99; rr++) {
+						ztex_stats[i].readback_resync++;
+						nmsleep(2);
+						libztex_selectFpga(ztex, i);
+						rc = libztex_readData(ztex, &nonce, &hash7, golden);
+					}
+				}
 
-				/* Shared-bus readback DESYNC fix: a read can silently return
+				/* Shared-bus readback DESYNC fix (now a rare backstop): a read can silently return
 				 * all-zeros while the FPGA is provably hashing (nonce was
 				 * already deep into the range). golden==0 is skipped silently
 				 * by the dedup logic below, so every desynced poll throws away
@@ -3414,6 +3427,46 @@ static void *ztex_miner_thread(void *userdata)
 				if (opt_algo == ALGO_SHA3T) {
 					if (nonce > last_nonce[i])
 						last_nonce[i] = nonce;
+
+					/* checkNonce (ported from the proven cgminer ztex driver):
+					 * the FPGA latches core 0's last (nonce, hash7) pair
+					 * together at S_CHECK. Recompute the hash on the host and
+					 * compare — a mismatch is a REAL hash error (typically a
+					 * timing violation at the current clock). This is the
+					 * instrument the btcminer-era stack used to govern each
+					 * FPGA's clock; without it a silent overclock is invisible
+					 * (wrong hashes almost never cross the golden threshold).
+					 * Core 0 scans nonces = 0 mod NCORES(10): a readback nonce
+					 * with nonce%10 != 0 is bus corruption, not a hash error.
+					 * Skip the first polls of a window (stale-work race). */
+					if (count >= 3 && nonce > 1000 && nonce == last_nonce[i]) {
+						if (nonce % 10 != 0) {
+							ztex_stats[i].readback_resync++;
+						} else if (nonce != ztex_stats[i].last_checked_nonce) {
+							uint32_t chk_hash[8];
+							uint32_t saved = work[i].data[g_nonce_word_index];
+							work[i].data[g_nonce_word_index] = nonce;
+							calc_hash((unsigned char *)work[i].data, (unsigned char *)chk_hash);
+							work[i].data[g_nonce_word_index] = saved;
+							ztex_stats[i].hash_checks++;
+							if (chk_hash[7] != hash7)
+								ztex_stats[i].hash_errors++;
+							ztex_stats[i].last_checked_nonce = nonce;
+							/* governor ledger (cgminer semantics): decayed
+							 * error count/weight per frequency step M */
+							{
+								int m = ztex_stats[i].gov_m;
+								ztex_stats[i].gov_errorCount[m] *= 0.995;
+								ztex_stats[i].gov_errorWeight[m] = ztex_stats[i].gov_errorWeight[m] * 0.995 + 1.0;
+								if (chk_hash[7] != hash7)
+									ztex_stats[i].gov_errorCount[m] += 1.0;
+								ztex_stats[i].gov_errorRate[m] = ztex_stats[i].gov_errorCount[m] / ztex_stats[i].gov_errorWeight[m]
+									* (ztex_stats[i].gov_errorWeight[m] < 100 ? ztex_stats[i].gov_errorWeight[m] * 0.01 : 1.0);
+								if (ztex_stats[i].gov_errorRate[m] > ztex_stats[i].gov_maxErrorRate[m])
+									ztex_stats[i].gov_maxErrorRate[m] = ztex_stats[i].gov_errorRate[m];
+							}
+						}
+					}
 				}
 				// Check If FPGA Has Processed All Nonces For The Work
 				else if ( nonce < last_nonce[i] ) {
@@ -3553,9 +3606,11 @@ static void *ztex_miner_thread(void *userdata)
 						double mhps = ztex_stats[i].hashrate_smooth/1000000.0;
 						double wmh = (mhps > 0.01) ? (opt_watts_per_fpga / mhps) : 0.0;
 						double mhw = (opt_watts_per_fpga > 0.01) ? (mhps / opt_watts_per_fpga) : 0.0;
-						applog(LOG_WARNING, "HEARTBEAT %s%d %.2f MH/s %.1fW %.2f MH/s/W %.3f W/MHs HWtotal=%u RS=%d",
+						applog(LOG_WARNING, "HEARTBEAT %s%d %.2f MH/s %.1fW %.2f MH/s/W %.3f W/MHs HWtotal=%u RS=%d ERR=%.1f%%(%d)",
 							fpga->short_name, i, mhps, opt_watts_per_fpga, mhw, wmh, ztex_stats[i].hw_errors,
-							ztex_stats[i].readback_resync);
+							ztex_stats[i].readback_resync,
+							ztex_stats[i].hash_checks ? 100.0 * ztex_stats[i].hash_errors / ztex_stats[i].hash_checks : 0.0,
+							ztex_stats[i].hash_checks);
 						board_mhps += mhps; board_active++;
 					}
 					if (board_active > 0) {
@@ -3578,10 +3633,52 @@ static void *ztex_miner_thread(void *userdata)
 		// Check & Adjust ZTEX Clock Frequency
 		for (i=0; i < num_fpgas; i++) {
 			if (ztex_stats[i].enabled && ztex_stats[i].hashrate > 0) {
-				
+
 				// Ellapsed Time Since Last Frequency Check
 				timeval_subtract(&elapsed, &tv_end, &ztex_stats[i].freq_check_tv);
-				
+
+				/* SHA3T + rev11 bitstream: cgminer/btcminer-style governor.
+				 * Every 30s pick bestM maximizing (M+1)*(1-maxErrorRate[M])
+				 * over the proven range, with hysteresis on the current M.
+				 * Climb beyond default only with >150 error-weight evidence.
+				 * freq = 4*(M+1) MHz; M 18..23 = 76..96 MHz. */
+				#define GOV_MIN_M 18
+				#define GOV_MAX_M 23
+				#define GOV_MAXMAXERRORRATE 0.05
+				#define GOV_HYSTERESIS 0.1
+				if (opt_algo == ALGO_SHA3T && opt_auto_freq) {
+					if (elapsed.tv_sec >= 30) {
+						struct ztex_stats *zs = &ztex_stats[i];
+						int m, maxM, bestM;
+						double r, bestR;
+						int defM = zs->freq;              /* startup M (from --ztex) */
+						if (zs->gov_m < GOV_MIN_M) zs->gov_m = defM;
+						maxM = GOV_MIN_M;
+						while (maxM < defM && zs->gov_maxErrorRate[maxM + 1] < GOV_MAXMAXERRORRATE)
+							maxM++;
+						while (maxM < GOV_MAX_M && zs->gov_errorWeight[maxM] > 150 &&
+						       zs->gov_maxErrorRate[maxM + 1] < GOV_MAXMAXERRORRATE)
+							maxM++;
+						bestM = GOV_MIN_M; bestR = 0;
+						for (m = GOV_MIN_M; m <= maxM; m++) {
+							r = (m + 1 + (m == zs->gov_m ? GOV_HYSTERESIS : 0)) * (1 - zs->gov_maxErrorRate[m]);
+							if (r > bestR) { bestM = m; bestR = r; }
+						}
+						if (bestM != zs->gov_m) {
+							applog(LOG_WARNING, "%s-%d: governor %d -> %d MHz (errRate %.4f -> %.4f)",
+								fpga->short_name, i, 4*(zs->gov_m+1), 4*(bestM+1),
+								zs->gov_errorRate[zs->gov_m], zs->gov_errorRate[bestM]);
+							zs->gov_m = bestM;
+							libztex_selectFpga(ztex, i);
+							libztex_setFreq(ztex, bestM);
+							/* clock change corrupts in-flight state: resend work */
+							work_restart[thr_id].restart = 1;
+						}
+						gettimeofday(&zs->freq_check_tv, NULL);
+					}
+					continue;   /* governor replaces the legacy auto-freq below */
+				}
+
 				// Restart Frequency Check Error Count Every 2 Minutes
 				if(elapsed.tv_sec > 120) {
 

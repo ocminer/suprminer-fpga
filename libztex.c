@@ -687,24 +687,28 @@ int libztex_sendData(struct libztex_device *ztex, unsigned char *sendbuf, int le
 int libztex_readData(struct libztex_device *ztex, uint32_t *nonce, uint32_t *hash7, uint32_t *golden)
 {
 	unsigned char rbuf[16];		// Stores GN1, Nonce, Hash, GN2
-	int ret = 16;
-	int cnt = 0, len = 0;
+	int cnt;
 
 	if (ztex->hndl == NULL)
 		return 0;
 
-	while (ret > 0) {
-		cnt = libusb_control_transfer(ztex->hndl, 0xc0, 0x81, 0, 0, rbuf + len, ret, 1000);
-		if (cnt >= 0) {
-			ret -= cnt;
-			len += cnt;
-		} else
-			break;
-	}
-
+	/* The FPGA serves these 16 bytes from a walking read pointer. A short
+	 * EP0 transfer leaves the pointer mid-stream and a "continuation" read
+	 * restarts from that offset, so stitching fragments assembles ROTATED
+	 * data — and since the chain is exactly 16 bytes, the misalignment
+	 * never self-heals by reading (only re-select resets the pointer).
+	 * Under multi-board bus contention short reads are common; they were
+	 * silently corrupting nonce/golden readbacks (huge share loss).
+	 * Therefore: demand all 16 bytes in ONE transfer; report a short read
+	 * as -99 so the caller re-selects (pointer reset) and retries. */
+	cnt = libusb_control_transfer(ztex->hndl, 0xc0, 0x81, 0, 0, rbuf, 16, 1000);
 	if (unlikely(cnt < 0)) {
 		applog(LOG_ERR, "%s: Unable To Read ZTEX (Error: %d)", ztex->repr, cnt);
 		return cnt;
+	}
+	if (unlikely(cnt != 16)) {
+		applog(LOG_DEBUG, "%s: short readback (%d of 16) - pointer desync, needs re-select", ztex->repr, cnt);
+		return -99;
 	}
 	
 	memcpy((unsigned char*)&golden[0], &rbuf[0], 4);

@@ -200,6 +200,18 @@ struct ztex_stats {
 	int submitted;
 	int hw_errors;
 	int readback_resync;           /* shared-bus zero-readback resyncs (silent share-loss fix) */
+	int hash_checks;               /* checkNonce validations (cur_nonce/cur_hash7 recompute) */
+	int hash_errors;               /* validations that MISMATCHED = real hash errors (timing) */
+	uint32_t last_checked_nonce;   /* dedup for checkNonce (validate each nonce once) */
+
+	/* Frequency governor (ported from cgminer driver-ztex / btcminer):
+	 * per-M error ledger fed by checkNonce; freq = 4*(M+1) MHz.
+	 * Only effective with the rev11 programmable-clock bitstream. */
+	int    gov_m;                  /* current M index */
+	double gov_errorCount[32];
+	double gov_errorWeight[32];
+	double gov_errorRate[32];
+	double gov_maxErrorRate[32];
 	int accepted;                  /* per-FPGA accepted shares (for TUI) */
 	int rejected;                  /* per-FPGA rejected shares (for TUI) */
 	struct timeval last_share_tv;  /* time of last accepted/rejected share */
