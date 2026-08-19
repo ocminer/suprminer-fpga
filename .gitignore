@@ -30,3 +30,4 @@ odo_test
 odo_verify
 odo_verify2
 fpga-miner.c.current
+fleet_freq.conf

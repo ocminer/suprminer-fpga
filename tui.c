@@ -235,9 +235,12 @@ static void draw(void)
 			double mhw = (w > 0.01) ? mhps / w : 0.0;
 			char ago[16]; fmt_ago(ago, sizeof(ago), &s->last_share_tv);
 			const char *dev = (j == 0) ? f->name : "";
+			/* per-FPGA clock: variant governor stores MHz in s->freq
+			 * (legacy fixed-clock mode stores an M-index <= 32 there) */
+			double clk = (s->freq > 50) ? (double)s->freq : g_hash_clock_mhz;
 			snprintf(buf, sizeof(buf),
 				" %-16.16s -%d   %5.1f  %6.2f  %4.1f   %5.2f   %5d %4d %6s",
-				dev, j, g_hash_clock_mhz, mhps, w, mhw,
+				dev, j, clk, mhps, w, mhw,
 				s->accepted, s->rejected, ago);
 			if (!s->enabled) attron(COLOR_PAIR(CP_DIM));
 			mvprintw(y, 0, "%-*.*s", cols, cols, buf);

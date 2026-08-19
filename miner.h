@@ -207,7 +207,10 @@ struct ztex_stats {
 	/* Frequency governor (ported from cgminer driver-ztex / btcminer):
 	 * per-M error ledger fed by checkNonce; freq = 4*(M+1) MHz.
 	 * Only effective with the rev11 programmable-clock bitstream. */
-	int    gov_m;                  /* current M index */
+	int    gov_m;                  /* current ladder rung (variant gov) or M index (legacy) */
+	int    vg_snap_checks;         /* checkNonce snapshot at last governor window */
+	int    vg_snap_errors;
+	int    vg_clean_wins;          /* consecutive clean windows (for probe-up) */
 	double gov_errorCount[32];
 	double gov_errorWeight[32];
 	double gov_errorRate[32];

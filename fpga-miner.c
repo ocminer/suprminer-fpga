@@ -167,6 +167,91 @@ static unsigned g_submit_id = 4;   /* ids 1..3 reserved (subscribe/auth/etc.) */
 
 /* TUI accessor — algo_names[]/opt_algo are static to this file. */
 const char *tui_algo_name(void) { return algo_names[opt_algo]; }
+
+/* ---- Variant-ladder governor (plan-B) ----------------------------------
+ * The DCM_CLKGEN programmable-clock bitstream proved unplaceable, so the
+ * governor works by BITSTREAM SELECTION instead: fixed-clock variants
+ * bitstreams/ztex_sha3_<MHZ>.bit form a ladder; each FPGA is configured
+ * with its own rung (persisted in fleet_freq.conf as SERIAL:FPGA=MHZ) and
+ * stepped down on checkNonce errors / probed up after sustained clean
+ * windows (--auto-freq). Rungs discovered at startup; with no variant
+ * files present everything falls back to the single ztex_sha3.bit. */
+#define VG_NRUNGS 5
+static const int vg_mhz[VG_NRUNGS] = {76, 80, 84, 88, 92};
+static bool vg_avail[VG_NRUNGS];
+static bool vg_enabled = false;
+static int  vg_default_rung = 2;              /* 84 MHz */
+static int  vg_rung_tbl[64][4];               /* startup assignment per board/fpga */
+static pthread_mutex_t vg_lock = PTHREAD_MUTEX_INITIALIZER;
+#define VG_STATE_FILE "fleet_freq.conf"
+
+static const char *vg_bitfile(int rung)
+{
+	static char paths[VG_NRUNGS][64];
+	snprintf(paths[rung], 64, "bitstreams/ztex_sha3_%d.bit", vg_mhz[rung]);
+	return paths[rung];
+}
+
+static void vg_discover(void)
+{
+	int r, n = 0;
+	for (r = 0; r < VG_NRUNGS; r++) {
+		FILE *f = fopen(vg_bitfile(r), "rb");
+		vg_avail[r] = (f != NULL);
+		if (f) { fclose(f); n++; }
+	}
+	vg_enabled = (n >= 2);   /* a ladder needs at least two rungs */
+	if (vg_enabled)
+		applog(LOG_WARNING, "variant governor: %d rungs available", n);
+}
+
+static int vg_load_rung(const char *serial, int fpga)
+{
+	char line[128], key[64];
+	int mhz, r;
+	FILE *f = fopen(VG_STATE_FILE, "r");
+	snprintf(key, sizeof(key), "%s:%d=", serial, fpga);
+	if (f) {
+		while (fgets(line, sizeof(line), f)) {
+			if (strncmp(line, key, strlen(key)) == 0) {
+				mhz = atoi(line + strlen(key));
+				fclose(f);
+				for (r = 0; r < VG_NRUNGS; r++)
+					if (vg_mhz[r] == mhz && vg_avail[r]) return r;
+				return vg_default_rung;
+			}
+		}
+		fclose(f);
+	}
+	return vg_avail[vg_default_rung] ? vg_default_rung : 0;
+}
+
+static void vg_save_rung(const char *serial, int fpga, int rung)
+{
+	/* rewrite the whole (tiny) state file with this entry updated */
+	char lines[512][128]; int n = 0, i; bool found = false;
+	char key[64];
+	snprintf(key, sizeof(key), "%s:%d=", serial, fpga);
+	pthread_mutex_lock(&vg_lock);
+	FILE *f = fopen(VG_STATE_FILE, "r");
+	if (f) {
+		while (n < 512 && fgets(lines[n], 128, f)) {
+			if (strncmp(lines[n], key, strlen(key)) == 0) {
+				snprintf(lines[n], 128, "%s%d\n", key, vg_mhz[rung]);
+				found = true;
+			}
+			n++;
+		}
+		fclose(f);
+	}
+	f = fopen(VG_STATE_FILE, "w");
+	if (f) {
+		for (i = 0; i < n; i++) fputs(lines[i], f);
+		if (!found) fprintf(f, "%s%d\n", key, vg_mhz[rung]);
+		fclose(f);
+	}
+	pthread_mutex_unlock(&vg_lock);
+}
 uint64_t global_hashrate = 0;
 double stratum_diff = 0.;
 double net_diff = 0.;
@@ -2591,6 +2676,7 @@ static bool detect_fpga()
 				break;
 			case ALGO_SHA3T:
 				bitstream = "ztex_sha3.bit";
+				vg_discover();   /* variant ladder (plan-B governor) */
 				break;
 			default:
 				bitstream = "ztex_groestl.bit";
@@ -2623,9 +2709,18 @@ static bool detect_fpga()
 						continue;
 					}
 					if(!libztex_selectFpga(&ztex_info[i], j)) return false;
-					if(!libztex_configureFpga(&ztex_info[i], bitstream)) {
-						applog(LOG_ERR, "%s-%d: Configuration failed, skipping", ztex_info[i].repr, j);
-						continue;
+					{
+						const char *bf = bitstream;
+						if (opt_algo == ALGO_SHA3T && vg_enabled && i < 64) {
+							vg_rung_tbl[i][j] = vg_load_rung(ztex_info[i].repr, j);
+							bf = vg_bitfile(vg_rung_tbl[i][j]);
+							applog(LOG_WARNING, "%s-%d: variant %d MHz (%s)",
+								ztex_info[i].repr, j, vg_mhz[vg_rung_tbl[i][j]], bf);
+						}
+						if(!libztex_configureFpga(&ztex_info[i], bf)) {
+							applog(LOG_ERR, "%s-%d: Configuration failed, skipping", ztex_info[i].repr, j);
+							continue;
+						}
 					}
 					if(!libztex_setFreq(&ztex_info[i], g_ztex_freq)) return false;
 					applog(LOG_WARNING, "%s-%d: Successfully configured", ztex_info[i].repr, j);
@@ -2700,8 +2795,14 @@ static bool initialize_ztex_miner(void *thr, int ztex_num)
 			fpga->ztex_stats[i].enabled = (!only || strchr(only, '0' + i) != NULL);
 		}
 		fpga->ztex_stats[i].hashrate = 0.0;
-		fpga->ztex_stats[i].freq = g_ztex_freq;
-		fpga->ztex_stats[i].gov_m = g_ztex_freq;   /* governor starts at --ztex M */
+		if (opt_algo == ALGO_SHA3T && vg_enabled && ztex_num < 64) {
+			/* variant governor: gov_m = ladder rung; freq = MHz (display) */
+			fpga->ztex_stats[i].gov_m = vg_rung_tbl[ztex_num][i];
+			fpga->ztex_stats[i].freq  = vg_mhz[vg_rung_tbl[ztex_num][i]];
+		} else {
+			fpga->ztex_stats[i].freq = g_ztex_freq;
+			fpga->ztex_stats[i].gov_m = g_ztex_freq;   /* legacy: --ztex M index */
+		}
 		gettimeofday(&fpga->ztex_stats[i].freq_check_tv, NULL);
 	}
 
@@ -3637,46 +3738,62 @@ static void *ztex_miner_thread(void *userdata)
 				// Ellapsed Time Since Last Frequency Check
 				timeval_subtract(&elapsed, &tv_end, &ztex_stats[i].freq_check_tv);
 
-				/* SHA3T + rev11 bitstream: cgminer/btcminer-style governor.
-				 * Every 30s pick bestM maximizing (M+1)*(1-maxErrorRate[M])
-				 * over the proven range, with hysteresis on the current M.
-				 * Climb beyond default only with >150 error-weight evidence.
-				 * freq = 4*(M+1) MHz; M 18..23 = 76..96 MHz. */
-				#define GOV_MIN_M 18
-				#define GOV_MAX_M 23
-				#define GOV_MAXMAXERRORRATE 0.05
-				#define GOV_HYSTERESIS 0.1
-				if (opt_algo == ALGO_SHA3T && opt_auto_freq) {
-					if (elapsed.tv_sec >= 30) {
+				/* SHA3T variant-ladder governor (--auto-freq): every 60s per
+				 * chip, evaluate the checkNonce window. Errors above 5% ->
+				 * step DOWN one available rung (reconfigure with the slower
+				 * variant). Clean (<0.5%) for 5 consecutive windows and a
+				 * faster rung exists whose recorded maxErrorRate is low ->
+				 * probe UP. Assignments persist in fleet_freq.conf. */
+				if (opt_algo == ALGO_SHA3T && vg_enabled && opt_auto_freq) {
+					if (elapsed.tv_sec >= 60) {
 						struct ztex_stats *zs = &ztex_stats[i];
-						int m, maxM, bestM;
-						double r, bestR;
-						int defM = zs->freq;              /* startup M (from --ztex) */
-						if (zs->gov_m < GOV_MIN_M) zs->gov_m = defM;
-						maxM = GOV_MIN_M;
-						while (maxM < defM && zs->gov_maxErrorRate[maxM + 1] < GOV_MAXMAXERRORRATE)
-							maxM++;
-						while (maxM < GOV_MAX_M && zs->gov_errorWeight[maxM] > 150 &&
-						       zs->gov_maxErrorRate[maxM + 1] < GOV_MAXMAXERRORRATE)
-							maxM++;
-						bestM = GOV_MIN_M; bestR = 0;
-						for (m = GOV_MIN_M; m <= maxM; m++) {
-							r = (m + 1 + (m == zs->gov_m ? GOV_HYSTERESIS : 0)) * (1 - zs->gov_maxErrorRate[m]);
-							if (r > bestR) { bestM = m; bestR = r; }
+						int checks = zs->hash_checks - zs->vg_snap_checks;
+						int errs   = zs->hash_errors - zs->vg_snap_errors;
+						int rung = zs->gov_m, nr = -1;
+						if (checks >= 20) {
+							double er = (double)errs / checks;
+							/* rung-indexed ledger for probe-up memory */
+							if (er > zs->gov_maxErrorRate[rung])
+								zs->gov_maxErrorRate[rung] = er;
+							if (er > 0.05) {
+								int r2 = rung - 1;
+								while (r2 >= 0 && !vg_avail[r2]) r2--;
+								if (r2 >= 0) nr = r2;
+								zs->vg_clean_wins = 0;
+							} else if (er < 0.005) {
+								if (++zs->vg_clean_wins >= 5) {
+									int r2 = rung + 1;
+									while (r2 < VG_NRUNGS && !vg_avail[r2]) r2++;
+									if (r2 < VG_NRUNGS && zs->gov_maxErrorRate[r2] < 0.10)
+										nr = r2;
+									zs->vg_clean_wins = 0;
+								}
+							} else
+								zs->vg_clean_wins = 0;
 						}
-						if (bestM != zs->gov_m) {
-							applog(LOG_WARNING, "%s-%d: governor %d -> %d MHz (errRate %.4f -> %.4f)",
-								fpga->short_name, i, 4*(zs->gov_m+1), 4*(bestM+1),
-								zs->gov_errorRate[zs->gov_m], zs->gov_errorRate[bestM]);
-							zs->gov_m = bestM;
+						if (nr >= 0 && nr != rung) {
+							applog(LOG_WARNING, "%s-%d: governor %d -> %d MHz (win err %d/%d)",
+								fpga->short_name, i, vg_mhz[rung], vg_mhz[nr], errs, checks);
 							libztex_selectFpga(ztex, i);
-							libztex_setFreq(ztex, bestM);
-							/* clock change corrupts in-flight state: resend work */
-							work_restart[thr_id].restart = 1;
+							if (libztex_configureFpga(ztex, vg_bitfile(nr))) {
+								zs->gov_m = nr;
+								zs->freq  = vg_mhz[nr];
+								vg_save_rung(ztex->repr, i, nr);
+								/* fresh chip: reset instruments, resend work */
+								zs->hash_checks = zs->hash_errors = 0;
+								zs->vg_snap_checks = zs->vg_snap_errors = 0;
+								zs->last_checked_nonce = 0;
+								work_restart[thr_id].restart = 1;
+							} else
+								applog(LOG_ERR, "%s-%d: governor reconfig FAILED, staying at %d MHz",
+									fpga->short_name, i, vg_mhz[rung]);
+						} else {
+							zs->vg_snap_checks = zs->hash_checks;
+							zs->vg_snap_errors = zs->hash_errors;
 						}
 						gettimeofday(&zs->freq_check_tv, NULL);
 					}
-					continue;   /* governor replaces the legacy auto-freq below */
+					continue;   /* replaces the legacy auto-freq below */
 				}
 
 				// Restart Frequency Check Error Count Every 2 Minutes
