@@ -3322,14 +3322,24 @@ static void *ztex_miner_thread(void *userdata)
 				// extra bus traffic CREATES the contention that desyncs.
 				libztex_selectFpga(ztex, i);
 				rc = libztex_readData(ztex, &nonce, &hash7, golden);
+				int read_recovered = 0;
 				{
 					int rr;
 					for (rr = 0; rr < 4 && rc == -99; rr++) {
 						ztex_stats[i].readback_resync++;
+						read_recovered = 1;
 						nmsleep(2);
 						libztex_selectFpga(ztex, i);
 						rc = libztex_readData(ztex, &nonce, &hash7, golden);
 					}
+				}
+				/* -99 exhausted: skip this poll, NEVER disable the FPGA for
+				 * bus weather (goldens are latched; next poll retries). */
+				if (rc == -99) {
+					if ((ztex_stats[i].readback_resync % 200) == 0)
+						applog(LOG_INFO, "%s-%d: short-read storm (RS=%d), polls skipped",
+							fpga->short_name, i, ztex_stats[i].readback_resync);
+					continue;
 				}
 
 				/* Shared-bus readback DESYNC fix (now a rare backstop): a read can silently return
@@ -3540,7 +3550,7 @@ static void *ztex_miner_thread(void *userdata)
 					 * Core 0 scans nonces = 0 mod NCORES(10): a readback nonce
 					 * with nonce%10 != 0 is bus corruption, not a hash error.
 					 * Skip the first polls of a window (stale-work race). */
-					if (count >= 3 && nonce > 1000 && nonce == last_nonce[i]) {
+					if (!read_recovered && count >= 3 && nonce > 1000 && nonce == last_nonce[i]) {
 						if (nonce % 10 != 0) {
 							ztex_stats[i].readback_resync++;
 						} else if (nonce != ztex_stats[i].last_checked_nonce) {
