@@ -3383,6 +3383,11 @@ static void *ztex_miner_thread(void *userdata)
 						continue;   /* still junk: drop this poll, keep FPGA enabled */
 				}
 
+				/* short reads (-99) from ANY path incl. the backstop retry
+				 * loops: bus weather, never a device failure. Skip the poll
+				 * silently; goldens stay latched. */
+				if (rc == -99)
+					continue;
 				if (rc < 0) {
 					applog(LOG_ERR, "ERROR: Failed To Read Data From %s-%d (rc=%d), retrying...", fpga->short_name, i, rc);
 					nmsleep(500);
