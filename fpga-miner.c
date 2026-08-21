@@ -188,7 +188,9 @@ static pthread_mutex_t vg_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char *vg_bitfile(int rung)
 {
 	static char paths[VG_NRUNGS][64];
-	snprintf(paths[rung], 64, "bitstreams/ztex_sha3_%d.bit", vg_mhz[rung]);
+	/* NOTE: open_bitstream() prepends "./bitstreams/" itself — pass the
+	 * bare filename (see feedback_bitstream_path). */
+	snprintf(paths[rung], 64, "ztex_sha3_%d.bit", vg_mhz[rung]);
 	return paths[rung];
 }
 
@@ -196,7 +198,9 @@ static void vg_discover(void)
 {
 	int r, n = 0;
 	for (r = 0; r < VG_NRUNGS; r++) {
-		FILE *f = fopen(vg_bitfile(r), "rb");
+		char probe[80];
+		snprintf(probe, sizeof(probe), "bitstreams/%s", vg_bitfile(r));
+		FILE *f = fopen(probe, "rb");
 		vg_avail[r] = (f != NULL);
 		if (f) { fclose(f); n++; }
 	}
