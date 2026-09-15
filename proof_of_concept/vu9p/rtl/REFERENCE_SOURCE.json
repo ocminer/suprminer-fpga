@@ -1,0 +1,47 @@
+{
+  "archived_bitstream_sha256": "659ed0b524d3ed22567903e98fa26e9a7d0cfea87efb3e70c147db7442fe4cb2",
+  "bit_for_bit_reproduction_claimed": false,
+  "description": "Reconstructed single-core reference RTL from preserved historical development sources.",
+  "exact_archival_source_snapshot": false,
+  "files": {
+    "bs1_reference.xdc": "7bdaa5fb61bb1c437312a790b4b78addb17e2f9ea030b18106185cb256ae336b",
+    "build_bs1_reference.tcl": "5d289b6fb2db760e9025e00ff606e902656a4b2936f42c6276c52a599192b872",
+    "rtl/axil_regfile.v": "8ff049d56b195873e75960fa9b9aaccb6b45a93756d4f7ffd36079ba53b6ca1a",
+    "rtl/keccak_round_c.v": "6609a9e2521b88978546c48471bf63769a35019c47a89f56e54090810a181ecd",
+    "rtl/sha3t_core1.v": "4605ba0244ab88ff0542f089f74ff08225057fae7c71776a3ff7cd112722ec77",
+    "rtl/sha3t_pipe.v": "f285809fc81bb05f654cb8ced43a51ffad13bb1ac9ac7b645063acf5555126fc",
+    "rtl/sha3t_top.v": "3a59b9c43559fe1594c38b287568b1d577b8b81a20c987ef158fc8c24d4025cb",
+    "test_bs1_reference.py": "f0d1ac3458e28d56dbc358ebaec34be8a8ebb5f6467a7970163819df7e54dd3a"
+  },
+  "fixed_design": {
+    "build_id": "5a3d0001",
+    "captures_per_triple_hash": 72,
+    "cores": 1,
+    "hash": "triple SHA3-256",
+    "nominal_control_mhz": 75,
+    "nominal_core_mhz": 300,
+    "part": "xcvu9p-fsgd2104-2L-e",
+    "round_captures_per_hash": 24
+  },
+  "reconstruction_changes": [
+    "Fixed one pipeline and 300 MHz core clock; removed parameterized core replication and reduction tree.",
+    "Held the first nonce through the initial invalid edge so nonce_base is not skipped.",
+    "Retained the historical direct/toggle control and result transfers; clarified non-atomic counter sampling and full-word AXI writes."
+  ],
+  "reference_hardware_qualified": false,
+  "reference_native_build_performed": false,
+  "schema": "BS1_REFERENCE_SOURCE_PACKAGE_REV1",
+  "simulation_scope": {
+    "bubbles_and_flush": true,
+    "controller_counted_results": 24,
+    "controller_hits": 13,
+    "controller_misses": 11,
+    "core_full_digest_comparisons": 32,
+    "nonce_wrap": true,
+    "nonce_zero": true,
+    "oracle": "Python hashlib.sha3_256 applied three times to 76 header bytes plus big-endian 32-bit nonce",
+    "pipeline_full_digest_comparisons": 25,
+    "top_level_vendor_ip_or_cdc_simulated": false
+  },
+  "vendor_ip": "Vivado generates jtag_axi 1.2 with AXI4-Lite protocol 2; generated vendor RTL is not included."
+}
