@@ -48,6 +48,9 @@ Experimental features and reference RTL are not a long-term stability guarantee.
 The optional image-frequency catalog is unbound; automatic frequency selection
 is not enabled by this release.
 
+For contributions and releases, follow the [public release boundary](PUBLICATION.md)
+and audit the staged files and outgoing commit history before pushing.
+
 ## Source and license
 
 Derived from cpuminer by Jeff Garzik, pooler and other contributors, with

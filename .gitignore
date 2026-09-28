@@ -26,6 +26,7 @@
 !/.gitignore
 !/CMakeLists.txt
 !/README.md
+!/PUBLICATION.md
 !/algo/KeccakP-800-SnP.h
 !/algo/KeccakP-800-reference.c
 !/algo/blake256-8.c
@@ -159,6 +160,8 @@
 !/stratum_transport_guard.h
 !/stratum_transport_guard_test.c
 !/tools/build-host.sh
+!/tools/check-public-release.py
+!/tools/test-public-release.py
 !/tools/test-vu9p-cli.py
 !/tools/test-vu9p-smoke.py
 !/tools/test-vu9p-worker.py
