@@ -39,6 +39,7 @@ operator. Never copy a command without replacing its placeholders.
 --ztex                ZTEX USB backend
 --vu9p ENDPOINTS       VU9P JTAG-AXI bridge backend
 --api-bind 0          Disable the optional miner API
+--tui                 Interactive ZTEX device table and miner log
 --help                Full command-line help
 ```
 
@@ -47,6 +48,34 @@ a suitable power supply and a single controller for each selected device.
 Experimental features and reference RTL are not a long-term stability guarantee.
 The optional image-frequency catalog is unbound; automatic frequency selection
 is not enabled by this release.
+
+## Run in a persistent terminal
+
+The miner runs as an ordinary foreground program; no mining service is required.
+To keep its terminal available after disconnecting, open a tmux shell:
+
+```sh
+tmux new-session -s fpgaminer
+```
+
+Run the complete miner command from the appropriate proof-of-concept guide
+inside that shell. Press **Ctrl-B, then D** to detach while mining continues.
+To return to its output:
+
+```sh
+tmux attach -t fpgaminer
+```
+
+Press **Ctrl-C** in the miner's terminal to stop the program, then rerun your
+command when ready. For VU9P, confirm the bridge's successful owner STOP before
+closing the bridge or reprogramming a card, as described in its guide. Detaching
+tmux does not stop mining, and tmux does not restart a miner that exits.
+
+For ZTEX, add `--tui` to show the device table above the live log; **Q** exits
+and **PgUp/PgDn** scroll the device table. It requires a terminal. The public
+TUI's device table currently covers ZTEX boards; use the ordinary miner output
+for the VU9P proof of concept. Site-specific launchers and dashboards are not
+included in this repository.
 
 For contributions and releases, follow the [public release boundary](PUBLICATION.md)
 and audit the staged files and outgoing commit history before pushing.

@@ -10,6 +10,17 @@ Keep private development trees and their Git history out of the public checkout.
 The default-deny `.gitignore` allows only individually reviewed paths; never use
 `git add -f` to move a private artifact past it.
 
+Keep local backups of private images outside every public checkout. Make a
+separate copy, rather than a hard link, and verify the source and backup with
+SHA-256 after copying. Restrict access to the backup directory and files. Keep
+the backup manifest, deployment bindings, operational handoffs and project
+memory private as well. A local copy on the same storage does not protect
+against failure of that storage.
+
+Changes to a private deployment are not automatically public host changes.
+Review the public branch independently and publish only applicable, reviewed
+changes; do not copy an entire private working tree into it.
+
 Before committing, inspect the complete staged diff and audit the actual index:
 
 ```sh
