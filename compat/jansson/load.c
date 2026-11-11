@@ -444,13 +444,14 @@ static int lex_scan_number(lex_t *lex, char c, json_error_t *error)
         value = strtol(saved_text, &end, 10);
         assert(end == saved_text + lex->saved_text.length);
 
-        if((value == LONG_MAX && errno == ERANGE) || value > INT_MAX) {
-            error_set(error, lex, "too big integer");
-            goto out;
-        }
-        else if((value == LONG_MIN && errno == ERANGE) || value < INT_MIN) {
-            error_set(error, lex, "too big negative integer");
-            goto out;
+        if(((value == LONG_MAX || value == LONG_MIN) && errno == ERANGE) || value > INT_MAX || value < INT_MIN) {
+            /* integers beyond the 32-bit json_int_t of this jansson are carried as reals
+             * (stratum difficulties such as 2^36 arrive as plain integers) */
+            double big = strtod(saved_text, &end);
+            assert(end == saved_text + lex->saved_text.length);
+            lex->token = TOKEN_REAL;
+            lex->value.real = big;
+            return 0;
         }
 
         lex->token = TOKEN_INTEGER;

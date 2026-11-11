@@ -43,15 +43,20 @@ ENDIF (CURL_FOUND)
 
 add_subdirectory(compat/jansson)
 
-include_directories(${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/algo ${PROJECT_SOURCE_DIR}/compat/jansson ${CURL_INCLUDE_DIR} ${LIBUSB_INCLUDE_DIR})
+include_directories(${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/algo ${PROJECT_SOURCE_DIR}/platform ${PROJECT_SOURCE_DIR}/compat/jansson ${CURL_INCLUDE_DIR} ${LIBUSB_INCLUDE_DIR})
 
 set(SRC_LIST fpga-miner.c
 		sha3_variant_state.c
 		sha3_variant_file.c
 		api.c
+		algo_table.c
 		fpgautils.c
 		libztex.c
 		libvu9p.c
+		./platform/vu9p_bridge.c
+		./platform/vu9p_proxima.c
+		./platform/vu9p_sha3t.c
+		./algo/proxima.c
 		tui.c
 		util.c
 		./algo/blake256-8.c

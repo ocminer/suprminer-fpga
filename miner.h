@@ -444,7 +444,21 @@ struct work {
 
 	int dev_board;   /* originating board index, or -1 (CPU/unknown) */
 	int dev_fpga;    /* originating FPGA index within the board */
+
+	/* Proxima (txid-blake2b) stratum dialect: the message is prefix || xnonce1 || xnonce2 and
+	 * the share carries the full 32-byte hash.  proxi_prefix is owned (work_clone_checked.h). */
+	unsigned char *proxi_prefix;
+	size_t proxi_prefix_len;
+	unsigned char xnonce1[16];
+	size_t xnonce1_len;
+	double proxi_ttl;            /* seconds the pool keeps the job valid */
+	struct timeval proxi_t0;     /* receipt time */
+	int proxi_k;                 /* required trailing zero bits (-1 unknown) */
+	uint32_t proxi_slot;
+	bool proxi_clean;
+	unsigned char proxi_hash[32];
 };
+#define WORK_HAS_PROXI_PREFIX 1
 
 struct thr_info {
 	int id;
@@ -473,6 +487,14 @@ struct stratum_job {
 	double diff;
 	uint64_t connection_generation;
 	uint64_t job_epoch;
+
+	/* Proxima dialect */
+	unsigned char *proxi_prefix;
+	size_t proxi_prefix_len;
+	uint32_t proxi_slot;
+	double proxi_ttl;
+	struct timeval proxi_t0;
+	int proxi_k;
 };
 
 struct stratum_ctx {
@@ -489,6 +511,7 @@ struct stratum_ctx {
 	struct stratum_transport_state transport;
 
 	double next_diff;
+	int proxi_k_next;            /* Proxima: k from the last mining.set_difficulty, -1 none */
 
 	char *session_id;
 	size_t xnonce1_size;
@@ -525,6 +548,11 @@ void stratum_request_reconnect(struct stratum_ctx *sctx,
 	uint64_t connection_generation);
 bool stratum_subscribe(struct stratum_ctx *sctx);
 bool stratum_authorize(struct stratum_ctx *sctx, const char *user, const char *pass);
+/* Set from the algorithm table in main(): how the pool talks (enum stratum_dialect). */
+extern int stratum_dialect;
+/* User agent sent in mining.subscribe (some pools gate on it); default USER_AGENT. */
+extern const char *stratum_user_agent;
+
 enum stratum_method_result stratum_handle_method(struct stratum_ctx *sctx,
 	const char *s);
 

@@ -7,8 +7,15 @@ The repository includes two BC3 (triple SHA3-256) proof-of-concept releases:
 - [VU9P single-core / 300-MHz bitstream and reference RTL](proof_of_concept/vu9p/README.md).
 
 ZTEX uses USB. VU9P uses an explicitly selected, loopback-only JTAG-AXI bridge.
-The host also contains Groestl, Myriad-Groestl, Blake256-8 and BLAKE3 algorithm
-support; compatible images for those algorithms are not included.
+The host also contains Groestl, Myriad-Groestl, Blake256-8, BLAKE3 and
+txid-blake2b (Proxima) algorithm support; compatible images for those
+algorithms are not included.
+
+One program, several board families and bitstreams: the board family is picked
+with `--fpga`, the bitstream with `--bitstream`, the algorithm with `-a`. The
+table in `algo_table.c` says which algorithm has a bitstream and a driver for
+which platform; serials, ports and tool paths are command-line options, never
+constants. See [Board platforms and bitstreams](#board-platforms-and-bitstreams).
 
 ## Build and test
 
@@ -37,7 +44,12 @@ operator. Never copy a command without replacing its placeholders.
 -u, --user WORKER      Pool worker
 -p, --pass PASSWORD    Pool password
 --ztex                ZTEX USB backend
---vu9p ENDPOINTS       VU9P JTAG-AXI bridge backend
+--vu9p ENDPOINTS       VU9P JTAG-AXI bridge backend (BS1 proof of concept)
+--fpga PLATFORM        Register-bridge backend: ztex or vu9p
+--bitstream FILE       Bitstream instead of the algorithm's default
+--device LIST          VU9P boards: host:port of a bridge or jtag:SERIAL[:port]
+--program              VU9P: load the bitstream over JTAG before mining
+--selftest             Run the algorithm's known-answer test and exit
 --api-bind 0          Disable the optional miner API
 --tui                 Interactive ZTEX device table and miner log
 --help                Full command-line help
@@ -48,6 +60,75 @@ a suitable power supply and a single controller for each selected device.
 Experimental features and reference RTL are not a long-term stability guarantee.
 The optional image-frequency catalog is unbound; automatic frequency selection
 is not enabled by this release.
+
+## Board platforms and bitstreams
+
+`--fpga vu9p` drives any VU9P bitstream that exposes one JTAG-AXI master
+through the algorithm-agnostic register bridge `platform/vu9p_bridge.tcl`
+(Vivado Lab Edition, free). A driver per bitstream family gives the registers
+their meaning:
+
+| Algorithm (`-a`) | Platform | Default bitstream | Driver |
+|---|---|---|---|
+| groestl, myr-gr, blakecoin, vcash, blake3, odo | ztex | see `bitstreams/README.md` | ZTEX USB backend |
+| sha3t | ztex | `ztex_sha3.bit` | ZTEX USB backend |
+| sha3t | vu9p | `vu9p_sha3t.bit` (not bundled) | `platform/vu9p_sha3t.c` (BS1 register map; the `--vu9p` backend remains for the published proof of concept) |
+| proxima | vu9p | `vu9p_proxima.bit` (not bundled yet) | `platform/vu9p_proxima.c` |
+
+Device specs are given on the command line only: `host:port` connects to a
+bridge somebody already started, `jtag:SERIAL[:port]` makes the miner start one
+`vivado_lab` bridge for that board (port 13400 + index by default). `--program`
+loads the bitstream first; `--selftest` runs the algorithm's known-answer test
+on every device and exits. Tool paths: `--vivado-lab`, `--hw-server`
+(default 127.0.0.1:3121), `--tcl-dir`, `--log-dir`.
+
+### Proxima (txid-blake2b)
+
+The Proxima pool protocol is a stratum dialect: `mining.notify` carries the
+transaction prefix and a ttl, a share is `[worker, job_id, extranonce2, hash]`,
+the difficulty is `2^k`. The FPGA enumerates the 48-bit extranonce2 itself; the
+host computes the per-job BLAKE2b constants, verifies every reported hit with
+its own BLAKE2b before submitting, and counts a mismatch as a hardware error.
+The miner never submits before the pool has sent a difficulty.
+
+```sh
+# program one board and run the built-in test (29 known-answer vectors plus a search check)
+./suprminer-fpga -a proxima --fpga vu9p --device jtag:SERIAL --bitstream /path/to/proxima.bit \
+    --program --selftest
+
+# mine; the pool login comes from a JSON file {"user": ..., "token": ..., "stratum": "..."}
+./suprminer-fpga -a proxima --fpga vu9p --device jtag:SERIAL \
+    --account my-account.json --worker rig1 --user-agent ProxiChorizo/2.0.0-fpga \
+    -o stratum+tcp://POOL:PORT
+
+# several boards, comma separated; a running bridge by host:port
+./suprminer-fpga -a proxima --fpga vu9p --device jtag:SERIAL0,jtag:SERIAL1,127.0.0.1:13402 ...
+```
+
+`--kmin` limits the hit rate the board reports (default 2^27 per hit), `--tmax`
+is the thermal stop (default 85 C, resume 5 C lower). The miner prints the
+measured counter rate, verified hits and hardware errors every 30 seconds.
+A Proxima demo bitstream is a separate release decision; none is included yet.
+
+### SHA3-256t (BC3) through the register bridge
+
+```sh
+./suprminer-fpga -a sha3t --fpga vu9p --device jtag:SERIAL --bitstream /path/to/sha3t.bit --program \
+    -o stratum+tcp://POOL:PORT -u WORKER -p x
+```
+
+The sha3t driver speaks the register map of the BS1 bitstream family. It has
+not been qualified on hardware in this release; the published proof of concept
+keeps using `--vu9p` and `proof_of_concept/vu9p/vu9p_bs1_bridge.tcl`.
+
+### Adding a bitstream family
+
+1. Pure hash code goes to `algo/`.
+2. A VU9P driver implements `struct vu9p_algo_driver` (`platform/vu9p_driver.h`):
+   open, start, stop, poll, hashes, work_expired, exhausted, selftest, status.
+   The miner thread, the stratum handling and the statistics are shared.
+3. One line in `algo_table.c` connects the algorithm name, the stratum dialect,
+   the default bitstreams per platform and the driver.
 
 ## Run in a persistent terminal
 

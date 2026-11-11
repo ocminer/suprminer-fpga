@@ -32,6 +32,10 @@ static inline void work_clone_release_owned(struct work *work,
 		allocator->release(allocator->context, work->job_id);
 	if (work->xnonce2)
 		allocator->release(allocator->context, work->xnonce2);
+#ifdef WORK_HAS_PROXI_PREFIX
+	if (work->proxi_prefix)
+		allocator->release(allocator->context, work->proxi_prefix);
+#endif
 	memset(work, 0, sizeof(*work));
 }
 
@@ -70,6 +74,9 @@ static inline bool work_clone_checked_with(struct work *destination,
 	temporary.workid = NULL;
 	temporary.job_id = NULL;
 	temporary.xnonce2 = NULL;
+#ifdef WORK_HAS_PROXI_PREFIX
+	temporary.proxi_prefix = NULL;
+#endif
 
 	if (!work_clone_string(&temporary.txs, source->txs, allocator) ||
 	    !work_clone_string(&temporary.workid, source->workid, allocator) ||
@@ -88,6 +95,18 @@ static inline bool work_clone_checked_with(struct work *destination,
 			goto fail;
 		memcpy(temporary.xnonce2, source->xnonce2, source->xnonce2_len);
 	}
+#ifdef WORK_HAS_PROXI_PREFIX
+	if (source->proxi_prefix_len != 0 && !source->proxi_prefix)
+		goto fail;
+	if (source->proxi_prefix_len != 0) {
+		temporary.proxi_prefix = allocator->allocate(allocator->context,
+			source->proxi_prefix_len);
+		if (!temporary.proxi_prefix)
+			goto fail;
+		memcpy(temporary.proxi_prefix, source->proxi_prefix,
+			source->proxi_prefix_len);
+	}
+#endif
 
 	*destination = temporary;
 	return true;

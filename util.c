@@ -1193,6 +1193,7 @@ static void stratum_job_release(struct stratum_job *job)
 		return;
 	free(job->job_id);
 	free(job->coinbase);
+	free(job->proxi_prefix);
 	if (job->merkle)
 		for (i = 0; i < job->merkle_count; ++i)
 			free(job->merkle[i]);
@@ -1812,6 +1813,9 @@ out:
 	return false;
 }
 
+int stratum_dialect = 0;                    /* STRATUM_BTC; main() sets it from the algorithm table */
+const char *stratum_user_agent = USER_AGENT;
+
 static json_t *stratum_subscribe_request(const char *session_id,
 	bool retry)
 {
@@ -1822,7 +1826,8 @@ static json_t *stratum_subscribe_request(const char *session_id,
 	if (!request || !params)
 		goto fail;
 	if (!retry) {
-		failed |= json_array_append_new(params, json_string(USER_AGENT));
+		failed |= json_array_append_new(params,
+			json_string(stratum_user_agent));
 		if (session_id)
 			failed |= json_array_append_new(params,
 				json_string(session_id));
@@ -2461,6 +2466,93 @@ err_out:
 	return false;
 }
 
+/* Proxima dialect: mining.notify = [job_id, "txid-blake2b", prefix_hex, prefix_len, slot, ttl_ms, clean].
+ * Same ownership and epoch rules as stratum_notify: the job is staged, validated, then swapped in under
+ * the socket and work locks and published through stratum_work_invalidated(). */
+static bool stratum_notify_proxima(struct stratum_ctx *sctx, json_t *params)
+{
+	const char *job_id, *type, *prefix;
+	struct stratum_job staged = { 0 };
+	struct stratum_job retired = { 0 };
+	size_t job_id_size, prefix_len;
+	json_t *jlen, *jttl, *jslot, *jclean;
+	bool ret = false;
+
+	if (!sctx || !json_is_array(params) || json_array_size(params) < 7)
+		goto invalid;
+	job_id = json_string_value(json_array_get(params, 0));
+	type = json_string_value(json_array_get(params, 1));
+	prefix = json_string_value(json_array_get(params, 2));
+	jlen = json_array_get(params, 3);
+	jslot = json_array_get(params, 4);
+	jttl = json_array_get(params, 5);
+	jclean = json_array_get(params, 6);
+	if (!job_id || !type || !prefix || !json_is_number(jlen) || !json_is_number(jttl) ||
+	    !json_is_boolean(jclean))
+		goto invalid;
+	if (strcmp(type, "txid-blake2b")) {
+		applog(LOG_INFO, "Stratum notify: ignoring job %.32s of type %.16s", job_id, type);
+		return true;
+	}
+	if (!stratum_string_bounded(job_id, STRATUM_JOB_ID_MAX, &job_id_size) || job_id_size == 0)
+		goto invalid;
+	if (json_number_value(jlen) < 1 || json_number_value(jlen) > 8192)
+		goto invalid;
+	prefix_len = (size_t) json_number_value(jlen);
+	if (strlen(prefix) != 2 * prefix_len)
+		goto invalid;
+	staged.job_id = (char *) malloc(job_id_size + 1);
+	staged.proxi_prefix = (unsigned char *) malloc(prefix_len);
+	if (!staged.job_id || !staged.proxi_prefix) {
+		applog(LOG_ERR, "Stratum notify: allocation failed");
+		goto out;
+	}
+	memcpy(staged.job_id, job_id, job_id_size + 1);
+	if (!hex2bin(staged.proxi_prefix, prefix, prefix_len)) {
+		applog(LOG_ERR, "Stratum notify: invalid hexadecimal data");
+		goto out;
+	}
+	staged.proxi_prefix_len = prefix_len;
+	staged.proxi_slot = json_is_number(jslot) ? (uint32_t) json_number_value(jslot) : 0;
+	staged.proxi_ttl = json_number_value(jttl) / 1000.0;
+	gettimeofday(&staged.proxi_t0, NULL);
+	staged.clean = json_is_true(jclean);
+
+	pthread_mutex_lock(&sctx->sock_lock);
+	if (!stratum_transport_can_control(&sctx->transport) ||
+	    sctx->sock == CURL_SOCKET_BAD) {
+		pthread_mutex_unlock(&sctx->sock_lock);
+		applog(LOG_ERR, "Stratum notify: inactive connection");
+		goto out;
+	}
+	pthread_mutex_lock(&sctx->work_lock);
+	staged.proxi_k = sctx->proxi_k_next;
+	staged.diff = sctx->next_diff;
+	staged.connection_generation = sctx->transport.generation;
+	staged.job_epoch = stratum_next_job_epoch_locked(sctx);
+	if (sctx->minimum_valid_job_epoch == 0 || staged.clean)
+		sctx->minimum_valid_job_epoch = staged.job_epoch;
+	stratum_job_detach_locked(sctx, &retired);
+	sctx->job = staged;
+	memset(&staged, 0, sizeof(staged));
+	pthread_mutex_unlock(&sctx->work_lock);
+	pthread_mutex_unlock(&sctx->sock_lock);
+	stratum_job_release(&retired);
+	stratum_work_invalidated();
+	if (opt_debug)
+		applog(LOG_DEBUG, "Stratum notify (proxima): job %s slot %u prefix_len %zu ttl %.1fs k %d clean %d",
+		       sctx->job.job_id, sctx->job.proxi_slot, prefix_len, sctx->job.proxi_ttl, sctx->job.proxi_k,
+		       sctx->job.clean);
+	ret = true;
+	goto out;
+
+invalid:
+	applog(LOG_ERR, "Stratum notify (proxima): invalid parameters");
+out:
+	stratum_job_release(&staged);
+	return ret;
+}
+
 static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 {
 	const char *job_id, *prevhash, *coinb1, *coinb2, *version, *nbits, *ntime;
@@ -2656,6 +2748,13 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 	}
 	pthread_mutex_lock(&sctx->work_lock);
 	sctx->next_diff = diff;
+	if (stratum_dialect == 1) {
+		/* Proxima sends 2^k; k = number of trailing zero bits the pool requires */
+		int k = 0;
+		if (diff >= 1.0) { uint64_t d = (uint64_t) diff; while (d > 1) { d >>= 1; k++; } }
+		else k = (int) diff;
+		sctx->proxi_k_next = k;
+	}
 	pthread_mutex_unlock(&sctx->work_lock);
 	pthread_mutex_unlock(&sctx->sock_lock);
 
@@ -2664,7 +2763,10 @@ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
 	stratum_diff = diff;
 	pthread_mutex_unlock(&stats_lock);
 
-	applog(LOG_WARNING, "Stratum difficulty set to %g", diff);
+	if (stratum_dialect == 1)
+		applog(LOG_WARNING, "Stratum difficulty set to 2^%d", sctx->proxi_k_next);
+	else
+		applog(LOG_WARNING, "Stratum difficulty set to %g", diff);
 
 	return true;
 }
@@ -2838,7 +2940,8 @@ enum stratum_method_result stratum_handle_method(struct stratum_ctx *sctx,
 	id = json_object_get(val, "id");
 
 	if (!strcasecmp(method, "mining.notify")) {
-		result = stratum_notify(sctx, params) ?
+		result = (stratum_dialect == 1 ? stratum_notify_proxima(sctx, params) :
+		          stratum_notify(sctx, params)) ?
 			STRATUM_METHOD_HANDLED : STRATUM_METHOD_FATAL;
 		goto out;
 	}

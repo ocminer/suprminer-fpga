@@ -79,6 +79,12 @@
 #include "ztex_rb_test.h"
 #include "algo/blake256-8.h"
 #include "algo/blake3.h"
+#include "algo/proxima.h"
+#include "algo_table.h"
+#include "platform/vu9p_bridge.h"
+#include "platform/vu9p_driver.h"
+
+static int proxima_submit_append_hash(json_t *params, const struct work *work);
 
 #ifdef WIN32
 #include "compat/winansi.h"
@@ -117,29 +123,7 @@ static struct workio_cmd bc3_ztex_v2_workio_stop_command = {
 	.cmd = WC_STOP
 };
 
-enum algos {
-	ALGO_DMD_GR,      // Groestl (double SHA256 on merkle)
-	ALGO_GROESTL,     // Groestl (single SHA256 on merkle)
-	ALGO_MYR_GR,      // Myriad Groestl (double SHA256 on merkle)
-	ALGO_BLAKECOIN,   // Blake 256 - 8 Rounds (single SHA256 on merkle)
-	ALGO_VCASH,       // Blake 256 - 8 Rounds (double SHA256 on merkle)
-	ALGO_BLAKE3,      // BLAKE3 - Decred DCP-0011 (180-byte header)
-	ALGO_ODO,         // OdoCrypt - DigiByte (standard 80-byte header)
-	ALGO_SHA3T,       // SHA3-256t - BitcoinIII/BC3 (standard 80-byte header)
-	ALGO_COUNT
-};
-
-static const char *algo_names[] = {
-	"dmd-gr",
-	"groestl",
-	"myr-gr",
-	"blakecoin",
-	"vcash",
-	"blake3",
-	"odo",
-	"sha3t",
-	"\0"
-};
+/* enum algos and algo_names[] live in algo_table.h / algo_table.c */
 
 bool opt_debug = false;
 bool opt_protocol = false;
@@ -523,6 +507,23 @@ bool opt_use_cpu = false;
 bool opt_use_serial = false;
 bool opt_use_ztex = false;
 bool opt_use_vu9p = false;
+
+/* --fpga <platform>, --bitstream, --device ... : platform and bitstream selection (see algo_table.h) */
+int   opt_fpga = PLATFORM_NONE;
+char *opt_bitstream = NULL;
+char *opt_device = NULL;
+bool  opt_program = false;
+bool  opt_selftest = false;
+char *opt_vivado_lab = NULL;
+char *opt_tcl_dir = NULL;
+char *opt_hw_server = NULL;
+char *opt_log_dir = NULL;
+char *opt_user_agent = NULL;
+char *opt_account = NULL;
+char *opt_worker = NULL;
+static const struct vu9p_algo_driver *vu9p_driver = NULL;
+static struct vu9p_tools g_vu9p_tools;
+extern uint64_t opt_vu9p_epoch;
 static bool opt_vu9p_build_id_set = false;
 static bool opt_vu9p_options_seen = false;
 static uint32_t opt_vu9p_build_id = 0;
@@ -610,6 +611,23 @@ Options:\n\
       --vu9p-active-lanes <n> BS1 requires 1\n\
       --vu9p-rate-hps <n>     BS1 requires 300000000\n\
       --vu9p-poll-work-ms <n> Poll interval + POLL + STOP latency bound\n\
+FPGA platform selection (register-bridge backend) ----------------------------\n\n\
+      --fpga <platform>      Board family: ztex or vu9p (VU9P = BCU-1525 and similar, JTAG-AXI bridge)\n\
+      --bitstream <file>     Bitstream to use instead of the algorithm's default (path or name under bitstreams/)\n\
+      --device <list>        VU9P boards, comma separated: host:port of a running bridge, or\n\
+                             jtag:SERIAL[:port] to start a bridge for that JTAG serial (port = 13400 + index)\n\
+      --program              VU9P: load the bitstream over JTAG before mining (needs jtag: devices)\n\
+      --selftest             Run the algorithm's known-answer test on every device and exit\n\
+      --vivado-lab <path>    vivado_lab executable (default: $VIVADO_LAB or PATH)\n\
+      --hw-server <host:port> Xilinx hw_server (default 127.0.0.1:3121)\n\
+      --tcl-dir <dir>        Directory with vu9p_bridge.tcl / vu9p_program.tcl (default: <exe dir>/platform)\n\
+      --log-dir <dir>        Where bridge and programming logs go (default .)\n\
+      --kmin <bits>          VU9P: minimum hardware difficulty 2^bits (hit-rate limiter, default 27)\n\
+      --tmax <C>             VU9P: stop a board above this temperature, resume 5 C lower (default 85)\n\
+      --epoch <hashes>       VU9P: hashes per work item before fresh work is requested (32-bit nonce cores)\n\
+      --user-agent <s>       User agent sent in mining.subscribe (some pools gate on it)\n\
+      --account <file.json>  Pool login from a file with keys user, token and stratum (Proxima pools)\n\
+      --worker <name>        Appended to the account user as user.worker\n\
       --auto-freq            Automatically adjust ZTEX chip frequency\n\
       --heartbeat-interval 20  Canary-only heartbeat cadence (default: 30 sec)\n\
   -F, --firmware             Reload firmware on ZTEX FPGAs\n\
@@ -667,6 +685,21 @@ static struct option const options[] = {
 	{ "vu9p-active-lanes", 1, NULL, 1052 },
 	{ "vu9p-rate-hps", 1, NULL, 1053 },
 	{ "vu9p-poll-work-ms", 1, NULL, 1054 },
+	{ "fpga", 1, NULL, 1070 },
+	{ "bitstream", 1, NULL, 1071 },
+	{ "device", 1, NULL, 1072 },
+	{ "program", 0, NULL, 1073 },
+	{ "selftest", 0, NULL, 1074 },
+	{ "vivado-lab", 1, NULL, 1075 },
+	{ "hw-server", 1, NULL, 1076 },
+	{ "tcl-dir", 1, NULL, 1077 },
+	{ "user-agent", 1, NULL, 1078 },
+	{ "kmin", 1, NULL, 1079 },
+	{ "tmax", 1, NULL, 1080 },
+	{ "account", 1, NULL, 1081 },
+	{ "worker", 1, NULL, 1082 },
+	{ "log-dir", 1, NULL, 1083 },
+	{ "epoch", 1, NULL, 1084 },
 	{ "auto-freq", 0, NULL, 1004 },
 	{ "watts-per-fpga", 1, NULL, 1008 },
 	{ "tui", 0, NULL, 1040 },
@@ -767,6 +800,7 @@ void get_currentalgo(char* buf, int sz)
 
 void proper_exit(int reason)
 {
+	vu9p_shutdown_all();
 	exit(reason);
 }
 
@@ -858,11 +892,14 @@ static inline void work_free(struct work *w)
 	if (w->workid) free(w->workid);
 	if (w->job_id) free(w->job_id);
 	if (w->xnonce2) free(w->xnonce2);
+	if (w->proxi_prefix) free(w->proxi_prefix);
 	w->txs = NULL;
 	w->workid = NULL;
 	w->job_id = NULL;
 	w->xnonce2 = NULL;
 	w->xnonce2_len = 0;
+	w->proxi_prefix = NULL;
+	w->proxi_prefix_len = 0;
 	w->connection_generation = 0;
 	w->job_epoch = 0;
 }
@@ -1418,8 +1455,10 @@ static enum upstream_submit_result submit_upstream_work(CURL *curl,
 			    json_array_append_new(params, json_string(rpc_user)) ||
 			    json_array_append_new(params, json_string(work->job_id)) ||
 			    json_array_append_new(params, json_string(xnonce2str)) ||
-			    json_array_append_new(params, json_string(ntimestr)) ||
-			    json_array_append_new(params, json_string(noncestr)) ||
+			    (stratum_dialect == STRATUM_PROXIMA ?
+			        proxima_submit_append_hash(params, work) :
+			        (json_array_append_new(params, json_string(ntimestr)) ||
+			         json_array_append_new(params, json_string(noncestr)))) ||
 			    json_object_set_new(request, "method",
 				    json_string("mining.submit")) ||
 			    json_object_set(request, "params", params) ||
@@ -2169,6 +2208,15 @@ enum stratum_gen_result {
 	STRATUM_GEN_READY = 1
 };
 
+/* Proxima share: [worker, job_id, extranonce2, hash] */
+static int proxima_submit_append_hash(json_t *params, const struct work *work)
+{
+	char *hashhex = abin2hex(work->proxi_hash, 32);
+	int rc = !hashhex || json_array_append_new(params, json_string(hashhex));
+	free(hashhex);
+	return rc;
+}
+
 static WORK_MUST_CHECK enum stratum_gen_result stratum_gen_work_result(
 		struct stratum_ctx *sctx, struct work *work)
 {
@@ -2220,6 +2268,60 @@ static WORK_MUST_CHECK enum stratum_gen_result stratum_gen_work_result(
 			stratum_request_reconnect(sctx, connection_generation);
 		}
 		return result;
+	} else if (stratum_dialect == STRATUM_PROXIMA) {
+		/* the FPGA enumerates extranonce2 itself; the work carries the prefix, the ttl and k */
+		uchar *new_prefix;
+
+		if (!sctx->job.job_id && !sctx->job.proxi_prefix &&
+		    sctx->job.connection_generation == 0 &&
+		    sctx->job.job_epoch == 0)
+			goto waiting_for_job;
+		if (!stratum_transport_job_usable(&sctx->transport,
+			sctx->job.connection_generation) ||
+		    sctx->job.job_epoch == 0 ||
+		    sctx->minimum_valid_job_epoch == 0 ||
+		    sctx->job.job_epoch < sctx->minimum_valid_job_epoch ||
+		    sctx->job.job_epoch > sctx->job_epoch_counter ||
+		    !sctx->job.job_id || !sctx->job.proxi_prefix ||
+		    sctx->job.proxi_prefix_len == 0 ||
+		    sctx->xnonce1_size == 0 || !sctx->xnonce1 ||
+		    sctx->xnonce1_size > sizeof(work->xnonce1))
+			goto allocation_failed;
+		new_job_id = strdup(sctx->job.job_id);
+		new_xnonce2 = (uchar *)calloc(1, sctx->xnonce2_size ? sctx->xnonce2_size : 1);
+		new_prefix = (uchar *)malloc(sctx->job.proxi_prefix_len);
+		if (!new_job_id || !new_xnonce2 || !new_prefix) {
+			free(new_prefix);
+			goto allocation_failed;
+		}
+		memcpy(new_prefix, sctx->job.proxi_prefix, sctx->job.proxi_prefix_len);
+		free(work->job_id);
+		free(work->xnonce2);
+		free(work->proxi_prefix);
+		work->job_id = new_job_id;
+		work->xnonce2 = new_xnonce2;
+		work->xnonce2_len = sctx->xnonce2_size;
+		work->proxi_prefix = new_prefix;
+		work->proxi_prefix_len = sctx->job.proxi_prefix_len;
+		new_job_id = NULL;
+		new_xnonce2 = NULL;
+		memcpy(work->xnonce1, sctx->xnonce1, sctx->xnonce1_size);
+		work->xnonce1_len = sctx->xnonce1_size;
+		work->proxi_ttl = sctx->job.proxi_ttl;
+		work->proxi_t0 = sctx->job.proxi_t0;
+		work->proxi_k = sctx->job.proxi_k;
+		work->proxi_slot = sctx->job.proxi_slot;
+		work->proxi_clean = sctx->job.clean;
+		work->connection_generation = sctx->job.connection_generation;
+		work->job_epoch = sctx->job.job_epoch;
+		memset(work->data, 0, sizeof(work->data));
+		memset(work->target, 0, sizeof(work->target));
+		memset(work->block_target, 0, sizeof(work->block_target));
+		work->dev_board = -1;
+		work->dev_fpga = -1;
+		pthread_mutex_unlock(&sctx->work_lock);
+		pthread_mutex_unlock(&sctx->sock_lock);
+		return STRATUM_GEN_READY;
 	} else {
 		if (!sctx->job.job_id && !sctx->job.coinbase &&
 		    sctx->job.connection_generation == 0 &&
@@ -3495,6 +3597,30 @@ void parse_arg(int key, char *arg)
 	case 'F':
 		opt_firmware = true;
 		break;
+	case 1070:			/* --fpga */
+		v = fpga_platform_lookup(arg);
+		if (v <= 0) {
+			applog(LOG_ERR, "Unknown FPGA platform '%s' (ztex, vu9p)", arg);
+			show_usage_and_exit(1);
+		}
+		opt_fpga = v;
+		if (opt_fpga == PLATFORM_ZTEX)
+			opt_use_ztex = true;
+		break;
+	case 1071: free(opt_bitstream); opt_bitstream = strdup(arg); break;
+	case 1072: free(opt_device); opt_device = strdup(arg); break;
+	case 1073: opt_program = true; break;
+	case 1074: opt_selftest = true; break;
+	case 1075: free(opt_vivado_lab); opt_vivado_lab = strdup(arg); break;
+	case 1076: free(opt_hw_server); opt_hw_server = strdup(arg); break;
+	case 1077: free(opt_tcl_dir); opt_tcl_dir = strdup(arg); break;
+	case 1078: free(opt_user_agent); opt_user_agent = strdup(arg); break;
+	case 1079: opt_vu9p_kmin = atoi(arg); break;
+	case 1080: opt_vu9p_tmax = atof(arg); break;
+	case 1081: free(opt_account); opt_account = strdup(arg); break;
+	case 1082: free(opt_worker); opt_worker = strdup(arg); break;
+	case 1083: free(opt_log_dir); opt_log_dir = strdup(arg); break;
+	case 1084: opt_vu9p_epoch = strtoull(arg, NULL, 0); break;
 	case 1001:
 		free(opt_cert);
 		opt_cert = strdup(arg);
@@ -3989,36 +4115,14 @@ static bool detect_fpga()
 			return false;
 		}
 
-		switch (opt_algo) {
-			case ALGO_DMD_GR:
-			case ALGO_GROESTL:
-				bitstream = "ztex_groestl.bit";
-				break;
-			case ALGO_MYR_GR:
-				bitstream = "ztex_myr_groestl.bit";
-				break;
-			case ALGO_BLAKECOIN:
-			case ALGO_VCASH:
-				bitstream = "ztex_blake256_8.bit";
-				break;
-			case ALGO_BLAKE3:
-				bitstream = "blake3_dcr.bit";
-				break;
-			case ALGO_ODO:
-				bitstream = "odo_dgb.bit";
-				break;
-			case ALGO_SHA3T:
-				if (sha3_bitstream_override_active) {
-					bitstream = sha3_bitstream_override;
-				} else {
-					bitstream = "ztex_sha3.bit";
-				}
-				break;
-			default:
-				bitstream = "ztex_groestl.bit";
-				break;
+		bitstream = opt_bitstream ? opt_bitstream : (char *) algo_table[opt_algo].ztex_bitstream;
+		if (opt_algo == ALGO_SHA3T && sha3_bitstream_override_active && !opt_bitstream)
+			bitstream = sha3_bitstream_override;
+		if (!bitstream) {
+			applog(LOG_ERR, "ERROR: algorithm %s has no ZTEX bitstream; pass --bitstream <file>", algo_names[opt_algo]);
+			return false;
 		}
-		
+
 		/* Resolve and validate every board's lane count/selection/order before
 		 * configuring the first FPGA.  The same stored policy later initializes
 		 * the runtime enable flags, so configuration and mining cannot disagree. */
@@ -7771,6 +7875,284 @@ static void *vu9p_miner_thread(void *userdata)
 }
 
 
+/* ---- --account <file.json>: {"user": ..., "token": ..., "stratum": "stratum+tcp://host:port"} */
+static bool load_account_file(const char *path)
+{
+	json_error_t err;
+	json_t *val = json_load_file(path, &err);
+	const char *user, *token, *url;
+
+	if (!val) {
+		applog(LOG_ERR, "account file %s: %s (line %d)", path, err.text, err.line);
+		return false;
+	}
+	user = json_string_value(json_object_get(val, "user"));
+	token = json_string_value(json_object_get(val, "token"));
+	url = json_string_value(json_object_get(val, "stratum"));
+	if (!user || !token) {
+		applog(LOG_ERR, "account file %s: needs string keys user and token", path);
+		json_decref(val);
+		return false;
+	}
+	free(rpc_user);
+	rpc_user = (char*) malloc(strlen(user) + (opt_worker ? strlen(opt_worker) + 1 : 0) + 1);
+	sprintf(rpc_user, "%s%s%s", user, opt_worker ? "." : "", opt_worker ? opt_worker : "");
+	free(rpc_pass);
+	rpc_pass = strdup(token);
+	free(rpc_userpass);
+	rpc_userpass = NULL;
+	if (!rpc_url && url)
+		parse_arg('o', (char*) url);
+	json_decref(val);
+	return true;
+}
+
+/* ---- VU9P platform (--fpga vu9p): devices, bridges, bitstream, driver ---- */
+bool vu9p_work_clone(struct work *dest, const struct work *src)
+{
+	memset(dest, 0, sizeof(*dest));
+	return work_clone_checked(dest, src);
+}
+
+void vu9p_work_release(struct work *w)
+{
+	work_free(w);
+}
+
+static const char *vu9p_default_tcl_dir(const char *argv0)
+{
+	static char dir[PATH_MAX];
+	char exe[PATH_MAX];
+	ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+	char *slash;
+	if (n <= 0) {
+		snprintf(exe, sizeof(exe), "%s", argv0 ? argv0 : ".");
+		n = strlen(exe);
+	}
+	exe[n] = 0;
+	slash = strrchr(exe, '/');
+	if (slash) *slash = 0; else strcpy(exe, ".");
+	snprintf(dir, sizeof(dir), "%s/platform", exe);
+	return dir;
+}
+
+static const char *vu9p_bitstream_path(void)
+{
+	static char path[PATH_MAX];
+	const char *bit = opt_bitstream ? opt_bitstream : algo_table[opt_algo].vu9p_bitstream;
+	if (!bit) return NULL;
+	if (access(bit, R_OK) == 0) return bit;
+	snprintf(path, sizeof(path), "bitstreams/%s", bit);
+	return path;
+}
+
+/* returns 0 to continue into mining, -1 on error; exits after --selftest */
+static int vu9p_setup(const char *argv0)
+{
+	int i, fails = 0;
+
+	vu9p_driver = algo_table[opt_algo].vu9p_driver;
+	if (!vu9p_driver) {
+		applog(LOG_ERR, "Algorithm %s has no VU9P driver (see algo_table.c)", algo_names[opt_algo]);
+		return -1;
+	}
+	if (!opt_device) {
+		applog(LOG_ERR, "--fpga vu9p needs --device host:port[,...] or jtag:SERIAL[:port][,...]");
+		return -1;
+	}
+	if (vu9p_parse_devices(opt_device) <= 0)
+		return -1;
+	g_vu9p_tools.vivado_lab = opt_vivado_lab ? opt_vivado_lab : getenv("VIVADO_LAB");
+	g_vu9p_tools.tcl_dir = opt_tcl_dir ? opt_tcl_dir : vu9p_default_tcl_dir(argv0);
+	g_vu9p_tools.hw_server = opt_hw_server;
+	g_vu9p_tools.log_dir = opt_log_dir ? opt_log_dir : ".";
+	g_vu9p_tools.io_timeout_ms = 30000;
+
+	if (opt_program) {
+		const char *bit = vu9p_bitstream_path();
+		if (!bit) {
+			applog(LOG_ERR, "No bitstream for %s on vu9p: pass --bitstream <file>", algo_names[opt_algo]);
+			return -1;
+		}
+		/* program every board before any bridge is opened: a JTAG programming
+		 * session stalls the other boards' bridges on the same hw_server */
+		for (i = 0; i < g_vu9p_count; i++)
+			if (vu9p_program(&g_vu9p_devs[i], bit, &g_vu9p_tools))
+				return -1;
+	}
+	for (i = 0; i < g_vu9p_count; i++) {
+		struct vu9p_dev *d = &g_vu9p_devs[i];
+		if (vu9p_spawn_bridge(d, &g_vu9p_tools) || vu9p_connect(d, &g_vu9p_tools))
+			return -1;
+		if (vu9p_rd(d, vu9p_driver->build_id_addr, &d->build_id))
+			return -1;
+		if (vu9p_driver->build_id_mask && (d->build_id & vu9p_driver->build_id_mask) != vu9p_driver->build_id_value) {
+			applog(LOG_ERR, "VU9P %d: build id %08x is not a %s bitstream (expected %08x under mask %08x); wrong --bitstream or not programmed?",
+			       i, d->build_id, vu9p_driver->name, vu9p_driver->build_id_value, vu9p_driver->build_id_mask);
+			return -1;
+		}
+		if (vu9p_driver->open(d))
+			return -1;
+	}
+	if (opt_selftest) {
+		for (i = 0; i < g_vu9p_count; i++)
+			if (vu9p_driver->selftest(&g_vu9p_devs[i]))
+				fails++;
+		applog(fails ? LOG_ERR : LOG_INFO, "VU9P selftest: %d of %d devices failed", fails, g_vu9p_count);
+		vu9p_shutdown_all();
+		exit(fails ? 1 : 0);
+	}
+	return 0;
+}
+
+static int vu9p_submit_cb(void *ctx, struct work *w)
+{
+	return submit_work((struct thr_info *) ctx, w) ? 0 : -1;
+}
+
+static void vu9p_reconnect(struct vu9p_dev *dev)
+{
+	int tries = 0;
+	while (1) {
+		nmsleep(5000);
+		if (vu9p_connect(dev, &g_vu9p_tools) == 0 && vu9p_driver->open(dev) == 0)
+			return;
+		if (++tries % 12 == 0)
+			applog(LOG_ERR, "VU9P %d: still no bridge after %d s", dev->index, tries * 5);
+	}
+}
+
+/* Algorithm-agnostic VU9P miner thread: the driver from the algorithm table owns the registers. */
+static void *vu9p_driver_thread(void *userdata)
+{
+	struct thr_info *mythr = (struct thr_info *) userdata;
+	int thr_id = mythr->id, ci = mythr->vu9p_card;
+	struct vu9p_dev *dev = &g_vu9p_devs[ci];
+	const struct vu9p_algo_driver *drv = vu9p_driver;
+	struct work work;
+	bool have_work = false, running = false, hot = false;
+	uint64_t done_total = 0, done_prev = 0, done_at_stat = 0;
+	struct timeval tv_stat, tv_now;
+	time_t last_temp = 0, last_rate = 0;
+	char status[200];
+
+	memset(&work, 0, sizeof(work));
+	gettimeofday(&tv_stat, NULL);
+	applog(LOG_INFO, "VU9P %d: miner thread %d started, %s driver on %s", ci, thr_id, drv->name, dev->spec);
+
+	while (1) {
+		bool fresh = false;
+		uint64_t cur_epoch;
+		int rc;
+
+		if (dev->fd < 0) {
+			running = false; have_work = false;
+			applog(LOG_WARNING, "VU9P %d: bridge connection lost, reconnecting", ci);
+			vu9p_reconnect(dev);
+			continue;
+		}
+		if (!have_stratum || jsonrpc_2) {
+			applog(LOG_ERR, "VU9P: only standard Stratum is supported");
+			nmsleep(5000);
+			continue;
+		}
+
+		/* a new pool job (new epoch) or the first one */
+		pthread_mutex_lock(&stratum.work_lock);
+		cur_epoch = stratum.job.job_epoch;
+		pthread_mutex_unlock(&stratum.work_lock);
+		if (!have_work || cur_epoch != work.job_epoch) {
+			enum stratum_gen_result generated = stratum_gen_work_result(&stratum, &work);
+			if (generated == STRATUM_GEN_READY) {
+				have_work = true;
+				fresh = true;
+			} else {
+				if (running) {
+					uint64_t done = 0;
+					if (drv->hashes(dev, &done) == 0 && done >= done_prev) done_total += done - done_prev;
+					drv->stop(dev); running = false;
+					applog(LOG_INFO, "VU9P %d: no stratum work, idle", ci);
+				}
+				have_work = false;
+				nmsleep(generated == STRATUM_GEN_WAIT ? 200 : 1000);
+				continue;
+			}
+		}
+		if (!fresh && running && drv->exhausted && drv->exhausted(dev)) {
+			/* same job, next extranonce2 */
+			uint64_t done = 0;
+			if (drv->hashes(dev, &done) == 0 && done >= done_prev) done_total += done - done_prev;
+			if (stratum_gen_work_result(&stratum, &work) == STRATUM_GEN_READY) {
+				fresh = true;
+			} else {
+				drv->stop(dev); running = false; have_work = false;
+				continue;
+			}
+		}
+		if (fresh && !hot) {
+			if (running) {
+				uint64_t done = 0;        /* book the old job's progress since the last sample */
+				if (drv->hashes(dev, &done) == 0 && done >= done_prev) done_total += done - done_prev;
+				drv->stop(dev); running = false;
+			}
+			rc = drv->start(dev, &work);
+			if (rc < 0) { drv->stop(dev); nmsleep(1000); continue; }
+			running = (rc == 0);
+			done_prev = 0;
+		}
+		if (running && drv->work_expired(&work)) {
+			uint64_t done = 0;
+			if (drv->hashes(dev, &done) == 0 && done >= done_prev) done_total += done - done_prev;
+			drv->stop(dev);
+			running = false;
+			applog(LOG_INFO, "VU9P %d: job %s expired (pool ttl), idle until the next job", ci, work.job_id);
+		}
+		if (running) {
+			if (drv->poll(dev, &work, vu9p_submit_cb, mythr) < 0)
+				continue;    /* fd closed by the bridge client: reconnect path above */
+		}
+
+		gettimeofday(&tv_now, NULL);
+		if (tv_now.tv_sec != last_rate) {
+			uint64_t done = 0;
+			last_rate = tv_now.tv_sec;
+			if (running && drv->hashes(dev, &done) == 0) {
+				if (done >= done_prev) done_total += done - done_prev;
+				done_prev = done;
+			}
+		}
+		if (tv_now.tv_sec - last_temp >= 5) {
+			last_temp = tv_now.tv_sec;
+			if (vu9p_sensors(dev) == 0) {
+				if (dev->temp_c >= opt_vu9p_tmax && !hot) {
+					hot = true;
+					if (running) { drv->stop(dev); running = false; }
+					applog(LOG_ERR, "VU9P %d: %.1f C >= %.0f C: STOPPED (thermal guard)", ci, dev->temp_c, opt_vu9p_tmax);
+				} else if (hot && dev->temp_c < opt_vu9p_tmax - 5) {
+					hot = false; have_work = false;    /* reload the job */
+					applog(LOG_WARNING, "VU9P %d: %.1f C, resuming", ci, dev->temp_c);
+				}
+			}
+		}
+		{
+			double secs = (tv_now.tv_sec - tv_stat.tv_sec) + (tv_now.tv_usec - tv_stat.tv_usec) / 1e6;
+			if (secs >= 30.0) {
+				double hps = (done_total - done_at_stat) / secs;
+				dev->hps = hps;
+				if ((size_t) thr_id < thr_hashrates_count)
+					thr_hashrates[thr_id] = hps;
+				done_at_stat = done_total;
+				tv_stat = tv_now;
+				drv->status(dev, status, sizeof(status));
+				applog(LOG_INFO, "VU9P %d: %.2f GH/s | %s | %.1f C vccint %.3f V%s", ci, hps / 1e9, status, dev->temp_c,
+				       dev->vccint_v, running ? "" : (hot ? " | thermal stop" : " | idle"));
+			}
+		}
+		nmsleep(running ? 20 : 100);
+	}
+	return NULL;
+}
+
 static void *key_monitor_thread(void *userdata)
 {
 	struct timeval now;
@@ -7893,6 +8275,22 @@ int main(int argc, char *argv[]) {
 
 	/* parse command line */
 	parse_cmdline(argc, argv);
+
+	if (opt_account && !load_account_file(opt_account))
+		return 1;
+	stratum_dialect = algo_table[opt_algo].dialect;
+	stratum.proxi_k_next = -1;
+	stratum.job.proxi_k = -1;
+	if (opt_user_agent)
+		stratum_user_agent = opt_user_agent;
+	if (opt_algo == ALGO_PROXIMA && proxi_cpu_selfcheck(opt_debug)) {
+		applog(LOG_ERR, "proxima CPU self-check failed; refusing to mine with a broken reference");
+		return 1;
+	}
+	if (opt_selftest && opt_fpga != PLATFORM_VU9P) {
+		applog(LOG_INFO, "selftest: no VU9P platform selected (--fpga vu9p --device ...), CPU reference check done");
+		return 0;
+	}
 
 	if (!rpc_url) {
 		// try default config file in binary folder
@@ -8083,28 +8481,12 @@ int main(int argc, char *argv[]) {
 		g_miner_count += g_vu9p_card_count;
 	}
 
-	switch (opt_algo) {
-		case ALGO_BLAKECOIN:
-		case ALGO_VCASH:
-			g_fpga_use_midstate = true;
-			g_fpga_work_len = 44;
-			g_nonce_word_index = 19;
-			break;
-		case ALGO_BLAKE3:
-			g_fpga_use_midstate = false;
-			g_fpga_work_len = 84;
-			g_nonce_word_index = 35;
-			break;
-		case ALGO_ODO:
-			g_fpga_use_midstate = false;
-			g_fpga_work_len = 76;  // 80-byte header minus 4-byte nonce
-			g_nonce_word_index = 19;  // standard nonce position
-			break;
-		default:
-			g_fpga_use_midstate = false;
-			g_fpga_work_len = 80;
-			g_nonce_word_index = 19;
-	}
+	if (opt_fpga == PLATFORM_VU9P && vu9p_setup(argv[0]))
+		return 1;
+
+	g_fpga_use_midstate = algo_table[opt_algo].midstate;
+	g_fpga_work_len = algo_table[opt_algo].fpga_work_len;
+	g_nonce_word_index = algo_table[opt_algo].nonce_word;
 	
 #ifdef WIN32
 	if (opt_priority > 0) {
@@ -8137,7 +8519,7 @@ int main(int argc, char *argv[]) {
 	 * one ztex_miner_thread is spawned per board. */
 	int n_alloc_threads = (int)hashrate_slot_count((size_t)g_miner_count,
 		(size_t)(g_serial_fpga_count + g_ztex_fpga_count +
-		         (opt_use_vu9p ? g_vu9p_card_count : 0)));
+		         (opt_use_vu9p ? g_vu9p_card_count : 0) + g_vu9p_count));
 
 	work_restart = (struct work_restart*) calloc(n_alloc_threads, sizeof(*work_restart));
 	if (!work_restart)
@@ -8351,12 +8733,30 @@ int main(int argc, char *argv[]) {
 		applog(LOG_INFO, "\t%d VU9P miner threads started.", g_vu9p_card_count);
 	}
 
+	// Register-bridge VU9P boards (--fpga vu9p): one algorithm-agnostic thread per board
+	if (opt_fpga == PLATFORM_VU9P) {
+		for (i = 0; i < g_vu9p_count; i++) {
+			thr = &thr_info[thr_idx];
+			thr->id = thr_idx++;
+			thr->vu9p_card = i;
+			thr->q = tq_new();
+			if (!thr->q)
+				return 1;
+			if (thread_create(thr, vu9p_driver_thread)) {
+				applog(LOG_ERR, "VU9P driver thread %d create failed", i);
+				return 1;
+			}
+		}
+		gettimeofday(&g_miner_start_time, NULL);
+		applog(LOG_INFO, "\t%d VU9P FPGA miner threads started.", g_vu9p_count);
+	}
+
 	// Start the keyboard monitor only after every device-worker slot.  The old
 	// fixed g_miner_count+4 index aliased the first serial/ZTEX worker and
 	// overwrote its queue/thread metadata after it had started.
 	if ((size_t)thr_idx != hashrate_monitor_index((size_t)g_miner_count,
 		(size_t)(g_serial_fpga_count + g_ztex_fpga_count +
-		         (opt_use_vu9p ? g_vu9p_card_count : 0))) ||
+		         (opt_use_vu9p ? g_vu9p_card_count : 0) + g_vu9p_count)) ||
 	    thr_idx >= n_alloc_threads) {
 		applog(LOG_ERR, "internal thread-slot layout mismatch");
 		if (bc3_ztex_v2_active && v2_ztex_thr_id >= 0)

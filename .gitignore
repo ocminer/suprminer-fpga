@@ -19,6 +19,7 @@
 !/proof_of_concept/
 !/proof_of_concept/rtl/
 !/proof_of_concept/vu9p/
+!/platform/
 !/proof_of_concept/vu9p/rtl/
 !/tools/
 
@@ -49,6 +50,10 @@
 !/algo/sph_groestl.c
 !/algo/sph_groestl.h
 !/algo/sph_types.h
+!/algo/proxima.c
+!/algo/proxima.h
+!/algo_table.c
+!/algo_table.h
 !/api.c
 !/api/API.class
 !/api/API.java
@@ -79,6 +84,7 @@
 !/bc3_ztex_shutdown_test.c
 !/bc3_ztex_work.h
 !/bc3_ztex_work_test.c
+!/bitstreams/README.md
 !/bitstreams/ztex_ufm1_15y1.bin
 !/byte_order_test.c
 !/compat.h
@@ -114,6 +120,13 @@
 !/odo_test.c
 !/odo_verify.c
 !/odo_verify2.c
+!/platform/vu9p_bridge.c
+!/platform/vu9p_bridge.h
+!/platform/vu9p_bridge.tcl
+!/platform/vu9p_driver.h
+!/platform/vu9p_program.tcl
+!/platform/vu9p_proxima.c
+!/platform/vu9p_sha3t.c
 !/proof_of_concept/README.md
 !/proof_of_concept/rtl/keccak_round.v
 !/proof_of_concept/rtl/sha3_core.v
