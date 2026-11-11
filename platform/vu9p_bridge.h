@@ -8,8 +8,9 @@
  *   jtag:SERIAL[:port]    start a bridge for the board with that JTAG serial
  *                         (port defaults to 13400 + device index); a bridge
  *                         already answering on that port is reused
- *   ftdi:SERIAL           native: the miner drives the board's FTDI JTAG cable itself
+ *   ftdi:SERIAL           direct: the miner drives the board's FTDI JTAG cable itself
  *                         (bitstream must carry the BSCANE2 register bus); no Vivado needed
+ *   SERIAL[:port]         bare serial: jtag: in --vu9p-mode bridge (default), ftdi: in --vu9p-mode direct
  */
 #ifndef VU9P_BRIDGE_H
 #define VU9P_BRIDGE_H
@@ -63,7 +64,9 @@ struct vu9p_tools {
 extern struct vu9p_dev g_vu9p_devs[VU9P_MAX_DEVICES];
 extern int g_vu9p_count;
 
-int  vu9p_parse_devices(const char *spec);                       /* fills g_vu9p_devs; returns count or -1 */
+/* default_transport decides what a bare SERIAL[:port] entry means (--vu9p-mode bridge|direct);
+ * explicit prefixes (host:port, jtag:, ftdi:) always win. */
+int  vu9p_parse_devices(const char *spec, int default_transport);  /* fills g_vu9p_devs; returns count or -1 */
 int  vu9p_program(struct vu9p_dev *d, const char *bitstream, const struct vu9p_tools *t);   /* 0 ok */
 int  vu9p_spawn_bridge(struct vu9p_dev *d, const struct vu9p_tools *t);                      /* 0 ok */
 int  vu9p_connect(struct vu9p_dev *d, const struct vu9p_tools *t);                           /* 0 ok */

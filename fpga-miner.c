@@ -525,6 +525,8 @@ static const struct vu9p_algo_driver *vu9p_driver = NULL;
 static struct vu9p_tools g_vu9p_tools;
 extern uint64_t opt_vu9p_epoch;
 int   opt_tck_khz = 0;
+int   opt_vu9p_mode = VU9P_TRANSPORT_BRIDGE;     /* --vu9p-mode bridge (default) | direct */
+bool  opt_program_only = false;                  /* --program-only: load the bitstream and exit */
 static bool opt_vu9p_build_id_set = false;
 static bool opt_vu9p_options_seen = false;
 static uint32_t opt_vu9p_build_id = 0;
@@ -618,8 +620,12 @@ FPGA platform selection (register-bridge backend) ----------------------------\n
       --device <list>        VU9P boards, comma separated: ftdi:SERIAL (native: the miner drives the FTDI\n\
                              JTAG cable, no Vivado), host:port of a running bridge, or jtag:SERIAL[:port]\n\
                              to start a vivado_lab bridge for that serial (port = 13400 + index)\n\
-      --tck-khz <n>          Native JTAG clock in kHz (default 15000)\n\
-      --program              VU9P: load the bitstream over JTAG before mining (needs jtag: devices)\n\
+      --vu9p-mode <m>        bridge (default): bare serials use a vivado_lab JTAG-AXI bridge, hw_server keeps the\n\
+                             cables (temperature guardians keep working); direct: the miner drives the FTDI\n\
+                             cable itself (no Vivado at all, cable must be free)\n\
+      --tck-khz <n>          Direct mode JTAG clock in kHz (default 15000)\n\
+      --program              VU9P: load the bitstream over JTAG before mining\n\
+      --program-only         VU9P: load the bitstream and exit (e.g. park a board on a blank image)\n\
       --selftest             Run the algorithm's known-answer test on every device and exit\n\
       --vivado-lab <path>    vivado_lab executable (default: $VIVADO_LAB or PATH)\n\
       --hw-server <host:port> Xilinx hw_server (default 127.0.0.1:3121)\n\
@@ -704,6 +710,8 @@ static struct option const options[] = {
 	{ "log-dir", 1, NULL, 1083 },
 	{ "epoch", 1, NULL, 1084 },
 	{ "tck-khz", 1, NULL, 1085 },
+	{ "vu9p-mode", 1, NULL, 1086 },
+	{ "program-only", 0, NULL, 1087 },
 	{ "auto-freq", 0, NULL, 1004 },
 	{ "watts-per-fpga", 1, NULL, 1008 },
 	{ "tui", 0, NULL, 1040 },
@@ -3626,6 +3634,12 @@ void parse_arg(int key, char *arg)
 	case 1083: free(opt_log_dir); opt_log_dir = strdup(arg); break;
 	case 1084: opt_vu9p_epoch = strtoull(arg, NULL, 0); break;
 	case 1085: opt_tck_khz = atoi(arg); break;
+	case 1087: opt_program = true; opt_program_only = true; break;
+	case 1086:			/* --vu9p-mode bridge|direct */
+		if (!strcasecmp(arg, "bridge")) opt_vu9p_mode = VU9P_TRANSPORT_BRIDGE;
+		else if (!strcasecmp(arg, "direct") || !strcasecmp(arg, "native")) opt_vu9p_mode = VU9P_TRANSPORT_JTAG;
+		else { applog(LOG_ERR, "--vu9p-mode must be bridge or direct"); show_usage_and_exit(1); }
+		break;
 	case 1001:
 		free(opt_cert);
 		opt_cert = strdup(arg);
@@ -7965,8 +7979,10 @@ static int vu9p_setup(const char *argv0)
 		applog(LOG_ERR, "--fpga vu9p needs --device ftdi:SERIAL | host:port | jtag:SERIAL[:port] (comma separated)");
 		return -1;
 	}
-	if (vu9p_parse_devices(opt_device) <= 0)
+	if (vu9p_parse_devices(opt_device, opt_vu9p_mode) <= 0)
 		return -1;
+	applog(LOG_INFO, "VU9P mode: %s (%d device%s)", opt_vu9p_mode == VU9P_TRANSPORT_JTAG ? "direct (FTDI JTAG, no bridge)" :
+	       "bridge (vivado_lab JTAG-AXI bridge, hw_server keeps the cables)", g_vu9p_count, g_vu9p_count == 1 ? "" : "s");
 	g_vu9p_tools.vivado_lab = opt_vivado_lab ? opt_vivado_lab : getenv("VIVADO_LAB");
 	g_vu9p_tools.tcl_dir = opt_tcl_dir ? opt_tcl_dir : vu9p_default_tcl_dir(argv0);
 	g_vu9p_tools.hw_server = opt_hw_server;
@@ -7985,6 +8001,11 @@ static int vu9p_setup(const char *argv0)
 		for (i = 0; i < g_vu9p_count; i++)
 			if (vu9p_program(&g_vu9p_devs[i], bit, &g_vu9p_tools))
 				return -1;
+		if (opt_program_only) {
+			applog(LOG_INFO, "programmed %d device%s, exiting (--program-only)", g_vu9p_count, g_vu9p_count == 1 ? "" : "s");
+			vu9p_shutdown_all();
+			exit(0);
+		}
 	}
 	for (i = 0; i < g_vu9p_count; i++) {
 		struct vu9p_dev *d = &g_vu9p_devs[i];
@@ -8293,7 +8314,7 @@ int main(int argc, char *argv[]) {
 		applog(LOG_ERR, "proxima CPU self-check failed; refusing to mine with a broken reference");
 		return 1;
 	}
-	if (opt_selftest && !rpc_url)
+	if ((opt_selftest || opt_program_only) && !rpc_url)
 		rpc_url = strdup("stratum+tcp://127.0.0.1:1");   /* selftest never connects; satisfy the URL check */
 	if (opt_selftest && opt_fpga != PLATFORM_VU9P) {
 		applog(LOG_INFO, "selftest: no VU9P platform selected (--fpga vu9p --device ...), CPU reference check done");

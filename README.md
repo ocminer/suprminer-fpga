@@ -47,7 +47,8 @@ operator. Never copy a command without replacing its placeholders.
 --vu9p ENDPOINTS       VU9P JTAG-AXI bridge backend (BS1 proof of concept)
 --fpga PLATFORM        Register-bridge backend: ztex or vu9p
 --bitstream FILE       Bitstream instead of the algorithm's default
---device LIST          VU9P boards: ftdi:SERIAL (native JTAG), host:port of a bridge or jtag:SERIAL[:port]
+--vu9p-mode MODE       bridge (default, vivado_lab bridge per board) or direct (FTDI cable driven by the miner)
+--device LIST          VU9P boards: SERIAL[:port] per mode, or explicit ftdi:SERIAL, host:port, jtag:SERIAL[:port]
 --program              VU9P: load the bitstream over JTAG before mining
 --selftest             Run the algorithm's known-answer test and exit
 --api-bind 0          Disable the optional miner API
@@ -82,9 +83,18 @@ loads the bitstream first; `--selftest` runs the algorithm's known-answer test
 on every device and exits. Tool paths: `--vivado-lab`, `--hw-server`
 (default 127.0.0.1:3121), `--tcl-dir`, `--log-dir`.
 
-### Native JTAG (no Vivado at run time)
+### VU9P modes: bridge or direct
 
-With `--device ftdi:SERIAL` the miner drives the board's FTDI JTAG cable itself
+`--vu9p-mode bridge` (default) talks to each board through a `vivado_lab`
+JTAG-AXI bridge the miner starts for it; Vivado's `hw_server` keeps the cables,
+so other tools (temperature guardians, programming scripts) keep working.
+`--vu9p-mode direct` drives the FTDI cable itself. A bare serial in `--device`
+follows the mode (`--device 214302895021A,21430289504CA`); explicit `jtag:`,
+`ftdi:` and `host:port` entries override it.
+
+### Direct mode (no Vivado at run time)
+
+With `--vu9p-mode direct` (or `--device ftdi:SERIAL`) the miner drives the board's FTDI JTAG cable itself
 (`platform/ftdi_mpsse.c`, libusb only) and talks to a BSCANE2 register bus in
 the bitstream (`platform/vu9p_jtag.c`); `--program` loads the bitstream over
 the same cable. No Vivado, hw_server, bridge process or helper script is

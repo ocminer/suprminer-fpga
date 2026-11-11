@@ -15,7 +15,7 @@
 #include "ftdi_mpsse.h"
 #include "vu9p_jtag.h"
 
-#define IR_LEN       6
+#define IR_BITS      6                /* per SLR; an SSI device presents 6 bits per SLR (XCVU9P: 18) */
 #define IR_IDCODE    0x09
 #define IR_USER1     0x02
 #define IR_JPROGRAM  0x0B
@@ -33,7 +33,21 @@ struct vu9p_jtag {
 	struct mpsse m;
 	int  user1_loaded;
 	uint8_t ack;                      /* last seen ack counter */
+	int  nslr;                        /* IR fields (SLRs) on the chain, from the IDCODE */
+	int  bus_field;                   /* IR field whose USER1 answers with the register bus magic */
 };
+
+/* Measured on an XCVU9P (3 SLRs): the IR is 18 bits = 3 fields of 6, the field shifted in LAST (highest
+ * bits) belongs to the configuration master SLR, and the data register is that SLR's register alone
+ * (no extra bypass bits from the slaves).  The other fields get BYPASS. */
+static int ir_len(struct vu9p_jtag *j) { return IR_BITS * (j->nslr > 0 ? j->nslr : 1); }
+static uint32_t ir_word(struct vu9p_jtag *j, uint32_t op, int field)
+{
+	uint32_t w = 0; int f, n = j->nslr > 0 ? j->nslr : 1;
+	for (f = 0; f < n; f++) w |= (f == field ? op : (uint32_t) IR_BYPASS) << (IR_BITS * f);
+	return w;
+}
+static int master_field(struct vu9p_jtag *j) { return (j->nslr > 0 ? j->nslr : 1) - 1; }
 
 static struct vu9p_jtag *J(struct vu9p_dev *d) { return (struct vu9p_jtag *) d->jtag; }
 
@@ -76,8 +90,8 @@ static int ensure_user1(struct vu9p_dev *d)
 	struct vu9p_jtag *j = J(d);
 	uint32_t cap = 0;
 	if (j->user1_loaded) return 0;
-	if (jtag_scan_ir(&j->m, IR_USER1, IR_LEN, &cap)) { fail(d); return -1; }
-	if ((cap & 0x3) != 0x1) { applog(LOG_ERR, "VU9P %d: unexpected IR capture %02x (no FPGA on the chain?)", d->index, cap); fail(d); return -1; }
+	if (jtag_scan_ir(&j->m, ir_word(j, IR_USER1, j->bus_field), ir_len(j), &cap)) { fail(d); return -1; }
+	if ((cap & 0x3) != 0x1) { applog(LOG_ERR, "VU9P %d: unexpected IR capture %05x (no FPGA on the chain?)", d->index, cap); fail(d); return -1; }
 	j->user1_loaded = 1;
 	return 0;
 }
@@ -99,8 +113,10 @@ static int run_scans(struct vu9p_dev *d, const uint64_t *reqs, int n, uint64_t *
 	free(reply);
 	for (i = 1; i <= n; i++) {
 		if (((rsps[i] >> 48) & 0xFFFF) != RSP_MAGIC) {
-			applog(LOG_ERR, "VU9P %d: register bus lost (response %016llx)", d->index, (unsigned long long) rsps[i]);
-			fail(d); return -1;
+			if (j->user1_loaded == 1 && d->fd >= 0 && rsps[i] != 0)
+				applog(LOG_ERR, "VU9P %d: register bus lost (response %016llx)", d->index, (unsigned long long) rsps[i]);
+			j->user1_loaded = 0;
+			return -1;
 		}
 	}
 	j->ack = rsp_ack(rsps[n]);
@@ -169,28 +185,39 @@ int vu9p_jtag_open_cable(struct vu9p_dev *d, int tck_hz)
 	if (j->m.h) mpsse_close(&j->m);
 	j->user1_loaded = 0;
 	if (mpsse_open(&j->m, d->serial, tck_hz)) return -1;
-	if (jtag_reset_to_idle(&j->m) || jtag_scan_ir(&j->m, IR_IDCODE, IR_LEN, &cap)) { mpsse_close(&j->m); return -1; }
-	if (jtag_scan_dr(&j->m, z, id, 32)) { mpsse_close(&j->m); return -1; }
+	/* after Test-Logic-Reset the master SLR selects IDCODE by itself */
+	if (jtag_reset_to_idle(&j->m) || jtag_scan_dr(&j->m, z, id, 32)) { mpsse_close(&j->m); return -1; }
 	idcode = id[0] | (id[1] << 8) | (id[2] << 16) | ((uint32_t) id[3] << 24);
+	j->nslr = ((idcode & 0x0FFFFFFF) == IDCODE_VU9P) ? 3 : 1;
+	j->bus_field = master_field(j);
 	if ((idcode & 0x0FFFFFFF) != IDCODE_VU9P)
-		applog(LOG_WARNING, "VU9P %d: JTAG IDCODE %08x is not an XCVU9P (%08x); continuing", d->index, idcode, IDCODE_VU9P);
-	else
-		applog(LOG_INFO, "VU9P %d: JTAG cable %s: XCVU9P IDCODE %08x, IR capture %02x", d->index, d->serial, idcode, cap);
+		applog(LOG_WARNING, "VU9P %d: JTAG IDCODE %08x is not an XCVU9P (%08x); assuming a single-SLR 6-bit IR", d->index, idcode, IDCODE_VU9P);
+	if (jtag_scan_ir(&j->m, ir_word(j, IR_IDCODE, master_field(j)), ir_len(j), &cap)) { mpsse_close(&j->m); return -1; }
+	applog(LOG_INFO, "VU9P %d: JTAG cable %s: IDCODE %08x, %d SLR field%s, IR capture %05x", d->index, d->serial, idcode,
+	       j->nslr, j->nslr == 1 ? "" : "s", cap);
 	d->fd = 1000000 + d->index;       /* "connected" for the miner thread */
 	return 0;
 }
 
 int vu9p_jtag_check_bus(struct vu9p_dev *d)
 {
+	struct vu9p_jtag *j = J(d);
 	uint32_t magic = 0;
-	J(d)->user1_loaded = 0;
-	if (vu9p_jtag_rd(d, VU9P_JTAG_REG_MAGIC, &magic)) return -1;
-	if (magic != VU9P_JTAG_MAGIC) {
-		applog(LOG_ERR, "VU9P %d: no register bus on USER1 (read %08x, expected %08x): is a native-JTAG bitstream loaded? (--program)",
-		       d->index, magic, VU9P_JTAG_MAGIC);
-		return -1;
+	int f, n = j->nslr > 0 ? j->nslr : 1;
+	/* the BSCANE2 of the design may sit in any SLR: try the master field first, then the others */
+	for (f = 0; f < n; f++) {
+		int field = (master_field(j) + n - f) % n;
+		j->bus_field = field; j->user1_loaded = 0;
+		if (vu9p_jtag_rd(d, VU9P_JTAG_REG_MAGIC, &magic) == 0 && magic == VU9P_JTAG_MAGIC) {
+			if (field != master_field(j)) applog(LOG_INFO, "VU9P %d: register bus found on IR field %d", d->index, field);
+			return 0;
+		}
+		if (d->fd < 0) return -1;      /* transport failure, not a missing bus */
 	}
-	return 0;
+	j->bus_field = master_field(j); j->user1_loaded = 0;
+	applog(LOG_ERR, "VU9P %d: no register bus on USER1 (last read %08x, expected %08x): is a native-JTAG bitstream loaded? (--program)",
+	       d->index, magic, VU9P_JTAG_MAGIC);
+	return -1;
 }
 
 int vu9p_jtag_open(struct vu9p_dev *d, int tck_hz)
@@ -279,12 +306,12 @@ int vu9p_jtag_program(struct vu9p_dev *d, const char *bitfile)
 	free(buf);
 
 	j->user1_loaded = 0;
-	if (jtag_reset_to_idle(&j->m) || jtag_scan_ir(&j->m, IR_JPROGRAM, IR_LEN, NULL) ||
-	    jtag_scan_ir(&j->m, IR_ISC_NOOP, IR_LEN, NULL)) goto fail;
+	if (jtag_reset_to_idle(&j->m) || jtag_scan_ir(&j->m, ir_word(j, IR_JPROGRAM, master_field(j)), ir_len(j), NULL) ||
+	    jtag_scan_ir(&j->m, ir_word(j, IR_ISC_NOOP, master_field(j)), ir_len(j), NULL)) goto fail;
 	mpsse_clock(&j->m, 100000);                      /* configuration memory clear */
 	if (mpsse_flush(&j->m, NULL, 0)) goto fail;
 	usleep(20000);
-	if (jtag_scan_ir(&j->m, IR_CFG_IN, IR_LEN, NULL)) goto fail;
+	if (jtag_scan_ir(&j->m, ir_word(j, IR_CFG_IN, master_field(j)), ir_len(j), NULL)) goto fail;
 	mpsse_tms_seq(&j->m, 0x01, 3);                   /* -> Shift-DR */
 	for (off = 0; off < dlen; ) {
 		size_t chunk = dlen - off > 32768 ? 32768 : dlen - off;
@@ -316,16 +343,18 @@ int vu9p_jtag_program(struct vu9p_dev *d, const char *bitfile)
 		if (mpsse_flush(&j->m, NULL, 0)) goto fail;
 	}
 	mpsse_tms_seq(&j->m, 0x01, 2);                   /* Update-DR -> RTI */
-	if (jtag_scan_ir(&j->m, IR_JSTART, IR_LEN, NULL)) goto fail;
+	if (jtag_scan_ir(&j->m, ir_word(j, IR_JSTART, master_field(j)), ir_len(j), NULL)) goto fail;
 	mpsse_clock(&j->m, 20000);                       /* startup sequence */
 	if (mpsse_flush(&j->m, NULL, 0)) goto fail;
 	usleep(50000);
-	if (jtag_scan_ir(&j->m, IR_BYPASS, IR_LEN, &cap)) goto fail;
+	if (jtag_scan_ir(&j->m, ir_word(j, IR_BYPASS, master_field(j)), ir_len(j), &cap)) goto fail;
 	free(rev);
-	applog(LOG_INFO, "VU9P %d: configuration shifted, IR capture after startup %02x (bit5 = DONE)", d->index, cap);
-	if (!(cap & 0x20)) applog(LOG_WARNING, "VU9P %d: IR capture suggests DONE low; checking the register bus anyway", d->index);
+	applog(LOG_INFO, "VU9P %d: configuration shifted, IR capture after startup %05x (bit 5 of the master field = DONE)", d->index, cap);
+	if (!((cap >> (IR_BITS * master_field(j))) & 0x20)) applog(LOG_WARNING, "VU9P %d: IR capture suggests DONE low", d->index);
 	j->user1_loaded = 0;
-	return vu9p_jtag_check_bus(d);
+	if (vu9p_jtag_check_bus(d))
+		applog(LOG_WARNING, "VU9P %d: programmed image has no USER1 register bus (fine for a blank image)", d->index);
+	return 0;
 fail:
 	free(rev);
 	applog(LOG_ERR, "VU9P %d: programming failed (JTAG transfer error)", d->index);

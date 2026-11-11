@@ -34,7 +34,7 @@ int g_vu9p_count = 0;
 
 static const char *tool_path(const char *p, const char *dflt) { return (p && *p) ? p : dflt; }
 
-int vu9p_parse_devices(const char *spec)
+int vu9p_parse_devices(const char *spec, int default_transport)
 {
 	char *copy, *tok, *save = NULL;
 	int n = 0;
@@ -51,8 +51,20 @@ int vu9p_parse_devices(const char *spec)
 		d->index = n; d->fd = -1; d->enabled = true;
 		pthread_mutex_init(&d->lock, NULL);
 		snprintf(d->spec, sizeof(d->spec), "%s", tok);
+		{	/* bare SERIAL[:port]: a JTAG serial has no dots and starts with a digit; choose by --vu9p-mode */
+			int bare = strncmp(tok, "ftdi:", 5) && strncmp(tok, "jtag:", 5) && !strchr(tok, '.') &&
+			           tok[0] >= '0' && tok[0] <= '9';
+			if (bare) {
+				char full[VU9P_SPEC_LEN + 8];
+				snprintf(full, sizeof(full), "%s%s", default_transport == VU9P_TRANSPORT_JTAG ? "ftdi:" : "jtag:", tok);
+				snprintf(d->spec, sizeof(d->spec), "%s", full);
+				tok = d->spec + 0;
+			}
+		}
 		if (!strncmp(tok, "ftdi:", 5)) {
-			snprintf(d->serial, sizeof(d->serial), "%s", tok + 5);
+			char *s = tok + 5, *c = strchr(s, ':');
+			if (c) *c = 0;                               /* a port makes no sense in direct mode: ignore it */
+			snprintf(d->serial, sizeof(d->serial), "%s", s);
 			d->transport = VU9P_TRANSPORT_JTAG;
 			d->port = 0;
 			n++;

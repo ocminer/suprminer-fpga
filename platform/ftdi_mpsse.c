@@ -143,9 +143,13 @@ int mpsse_open(struct mpsse *m, const char *serial, int tck_hz)
 	m->ep_in = (uint8_t)(0x81 + 2 * iface);
 	m->max_packet = 512;
 	libusb_set_auto_detach_kernel_driver(m->h, 1);
-	if (libusb_claim_interface(m->h, iface)) {
+	{	/* another tool (Vivado hw_server) may hold the cable for a moment: retry for a few seconds */
+		int tries = 0, rc;
+		while ((rc = libusb_claim_interface(m->h, iface)) != 0 && ++tries < 20) usleep(250000);
+		if (rc) {
 		applog(LOG_ERR, "mpsse %s: cannot claim USB interface %d (another program holds the cable: Vivado hw_server?)", serial, iface);
 		libusb_close(m->h); m->h = NULL; libusb_exit(m->ctx); m->ctx = NULL; return -1;
+		}
 	}
 	if (ctrl(m, SIO_RESET, SIO_RESET_SIO, iface + 1) || ctrl(m, SIO_SET_LATENCY, 2, iface + 1) ||
 	    ctrl(m, SIO_SET_BITMODE, 0x0000 | (BITMODE_RESET << 8), iface + 1) ||
