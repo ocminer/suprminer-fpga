@@ -47,7 +47,7 @@ operator. Never copy a command without replacing its placeholders.
 --vu9p ENDPOINTS       VU9P JTAG-AXI bridge backend (BS1 proof of concept)
 --fpga PLATFORM        Register-bridge backend: ztex or vu9p
 --bitstream FILE       Bitstream instead of the algorithm's default
---device LIST          VU9P boards: host:port of a bridge or jtag:SERIAL[:port]
+--device LIST          VU9P boards: ftdi:SERIAL (native JTAG), host:port of a bridge or jtag:SERIAL[:port]
 --program              VU9P: load the bitstream over JTAG before mining
 --selftest             Run the algorithm's known-answer test and exit
 --api-bind 0          Disable the optional miner API
@@ -81,6 +81,23 @@ bridge somebody already started, `jtag:SERIAL[:port]` makes the miner start one
 loads the bitstream first; `--selftest` runs the algorithm's known-answer test
 on every device and exits. Tool paths: `--vivado-lab`, `--hw-server`
 (default 127.0.0.1:3121), `--tcl-dir`, `--log-dir`.
+
+### Native JTAG (no Vivado at run time)
+
+With `--device ftdi:SERIAL` the miner drives the board's FTDI JTAG cable itself
+(`platform/ftdi_mpsse.c`, libusb only) and talks to a BSCANE2 register bus in
+the bitstream (`platform/vu9p_jtag.c`); `--program` loads the bitstream over
+the same cable. No Vivado, hw_server, bridge process or helper script is
+involved. The bitstream must contain the USER1 register bus (the b2b images
+built with `JTAG_NATIVE=1`); the `jtag:SERIAL` / `host:port` specs keep working
+for bitstreams that carry the Xilinx JTAG-to-AXI core. The cable must not be
+held by another program (stop Vivado's `hw_server` first). `--tck-khz` sets the
+JTAG clock (default 15000). Status of this release: implemented and unit-built;
+hardware qualification on BCU-1525 boards is pending.
+
+```sh
+./suprminer-fpga -a proxima --fpga vu9p --device ftdi:SERIALA --bitstream /path/to/proxima.bit --program --selftest
+```
 
 ### Proxima (txid-blake2b)
 

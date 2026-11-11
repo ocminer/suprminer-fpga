@@ -120,10 +120,14 @@
 !/odo_test.c
 !/odo_verify.c
 !/odo_verify2.c
+!/platform/ftdi_mpsse.c
+!/platform/ftdi_mpsse.h
 !/platform/vu9p_bridge.c
 !/platform/vu9p_bridge.h
 !/platform/vu9p_bridge.tcl
 !/platform/vu9p_driver.h
+!/platform/vu9p_jtag.c
+!/platform/vu9p_jtag.h
 !/platform/vu9p_program.tcl
 !/platform/vu9p_proxima.c
 !/platform/vu9p_sha3t.c

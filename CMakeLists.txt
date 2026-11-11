@@ -54,6 +54,8 @@ set(SRC_LIST fpga-miner.c
 		libztex.c
 		libvu9p.c
 		./platform/vu9p_bridge.c
+		./platform/ftdi_mpsse.c
+		./platform/vu9p_jtag.c
 		./platform/vu9p_proxima.c
 		./platform/vu9p_sha3t.c
 		./algo/proxima.c

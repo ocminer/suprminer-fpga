@@ -27,6 +27,7 @@
 
 #include "miner.h"
 #include "vu9p_bridge.h"
+#include "vu9p_jtag.h"
 
 struct vu9p_dev g_vu9p_devs[VU9P_MAX_DEVICES];
 int g_vu9p_count = 0;
@@ -50,6 +51,13 @@ int vu9p_parse_devices(const char *spec)
 		d->index = n; d->fd = -1; d->enabled = true;
 		pthread_mutex_init(&d->lock, NULL);
 		snprintf(d->spec, sizeof(d->spec), "%s", tok);
+		if (!strncmp(tok, "ftdi:", 5)) {
+			snprintf(d->serial, sizeof(d->serial), "%s", tok + 5);
+			d->transport = VU9P_TRANSPORT_JTAG;
+			d->port = 0;
+			n++;
+			continue;
+		}
 		if (!strncmp(tok, "jtag:", 5)) {
 			char *s = tok + 5;
 			colon = strchr(s, ':');
@@ -102,6 +110,11 @@ int vu9p_program(struct vu9p_dev *d, const char *bitstream, const struct vu9p_to
 	char logfile[512], bitpath[1024];
 	pid_t pid; int status;
 
+	if (d->transport == VU9P_TRANSPORT_JTAG) {
+		if (!d->jtag && vu9p_jtag_open_cable(d, t->tck_hz)) return -1;
+		return vu9p_jtag_program(d, bitstream);
+	}
+
 	if (!d->serial[0]) { applog(LOG_ERR, "VU9P %d: --program needs a jtag:SERIAL device spec", d->index); return -1; }
 	if (!realpath(bitstream, bitpath)) { applog(LOG_ERR, "VU9P %d: bitstream %s: %s", d->index, bitstream, strerror(errno)); return -1; }
 	snprintf(logfile, sizeof(logfile), "%s/vu9p_program_%s.log", tool_path(t->log_dir, "."), d->serial);
@@ -151,7 +164,7 @@ int vu9p_spawn_bridge(struct vu9p_dev *d, const struct vu9p_tools *t)
 	char logfile[512], portstr[16];
 	int i;
 
-	if (!d->own_bridge) return 0;
+	if (d->transport == VU9P_TRANSPORT_JTAG || !d->own_bridge) return 0;
 	/* a bridge that already answers on this port (left by a previous run or started by hand) is reused */
 	{
 		int fd = try_connect(d, 2000);
@@ -218,6 +231,7 @@ out:
 int vu9p_rd(struct vu9p_dev *d, uint32_t addr, uint32_t *val)
 {
 	char cmd[32], resp[64];
+	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_rd(d, addr, val);
 	snprintf(cmd, sizeof(cmd), "R %03x", addr);
 	if (bridge_cmd(d, cmd, resp, sizeof(resp))) return -1;
 	*val = (uint32_t) strtoul(resp + 3, NULL, 16);
@@ -227,6 +241,7 @@ int vu9p_rd(struct vu9p_dev *d, uint32_t addr, uint32_t *val)
 int vu9p_wr(struct vu9p_dev *d, uint32_t addr, uint32_t val)
 {
 	char cmd[48], resp[64];
+	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_wr(d, addr, val);
 	snprintf(cmd, sizeof(cmd), "W %03x %08x", addr, val);
 	return bridge_cmd(d, cmd, resp, sizeof(resp));
 }
@@ -235,6 +250,7 @@ int vu9p_rb(struct vu9p_dev *d, uint32_t addr, uint32_t *vals, int n)
 {
 	char cmd[32], resp[64 * 9 + 16], *p;
 	int i;
+	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_rb(d, addr, vals, n);
 	if (n > 64) return -1;
 	snprintf(cmd, sizeof(cmd), "RB %03x %d", addr, n);
 	if (bridge_cmd(d, cmd, resp, sizeof(resp))) return -1;
@@ -251,6 +267,7 @@ int vu9p_rb(struct vu9p_dev *d, uint32_t addr, uint32_t *vals, int n)
 int vu9p_wb(struct vu9p_dev *d, uint32_t addr, const uint32_t *vals, int n)
 {
 	int i, j;
+	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_wb(d, addr, vals, n);
 	for (i = 0; i < n; i += 32) {        /* keep lines short */
 		char cmd[32 * 9 + 16], resp[64];
 		int m = (n - i < 32) ? n - i : 32, len;
@@ -264,6 +281,7 @@ int vu9p_wb(struct vu9p_dev *d, uint32_t addr, const uint32_t *vals, int n)
 int vu9p_sensors(struct vu9p_dev *d)
 {
 	char resp[160], *p;
+	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_sensors(d);
 	if (bridge_cmd(d, "TEMP", resp, sizeof(resp))) return -1;
 	if ((p = strstr(resp, "C="))) d->temp_c = atof(p + 2);
 	if ((p = strstr(resp, "VCCINT="))) d->vccint_v = atof(p + 7);
@@ -282,7 +300,9 @@ int vu9p_ping(struct vu9p_dev *d, uint32_t *id)
 
 int vu9p_connect(struct vu9p_dev *d, const struct vu9p_tools *t)
 {
-	int fd = try_connect(d, t->io_timeout_ms > 0 ? t->io_timeout_ms : 30000);
+	int fd;
+	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_open(d, t->tck_hz);
+	fd = try_connect(d, t->io_timeout_ms > 0 ? t->io_timeout_ms : 30000);
 	if (fd < 0) { applog(LOG_ERR, "VU9P %d: cannot connect to bridge %s:%d", d->index, d->host, d->port); return -1; }
 	pthread_mutex_lock(&d->lock); d->fd = fd; pthread_mutex_unlock(&d->lock);
 	{ uint32_t naxi = 0; if (vu9p_ping(d, &naxi)) return -1; }
@@ -293,6 +313,7 @@ int vu9p_connect(struct vu9p_dev *d, const struct vu9p_tools *t)
 
 void vu9p_close(struct vu9p_dev *d)
 {
+	if (d->transport == VU9P_TRANSPORT_JTAG) { vu9p_jtag_close(d); return; }
 	pthread_mutex_lock(&d->lock);
 	if (d->fd >= 0) {
 		char resp[64]; ssize_t n;

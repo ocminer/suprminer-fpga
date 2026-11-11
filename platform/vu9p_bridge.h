@@ -8,6 +8,8 @@
  *   jtag:SERIAL[:port]    start a bridge for the board with that JTAG serial
  *                         (port defaults to 13400 + device index); a bridge
  *                         already answering on that port is reused
+ *   ftdi:SERIAL           native: the miner drives the board's FTDI JTAG cable itself
+ *                         (bitstream must carry the BSCANE2 register bus); no Vivado needed
  */
 #ifndef VU9P_BRIDGE_H
 #define VU9P_BRIDGE_H
@@ -18,6 +20,8 @@
 #include <sys/types.h>
 
 #define VU9P_MAX_DEVICES   16
+#define VU9P_TRANSPORT_BRIDGE 0     /* host:port or jtag:SERIAL  -> vivado_lab JTAG-AXI bridge */
+#define VU9P_TRANSPORT_JTAG   1     /* ftdi:SERIAL -> the miner drives the FTDI cable itself (no bridge) */
 #define VU9P_SPEC_LEN      128
 #define VU9P_BRIDGE_BASE_PORT 13400
 
@@ -27,6 +31,8 @@ struct vu9p_dev {
 	char     host[64];
 	int      port;
 	char     serial[48];            /* empty when connecting to an external bridge */
+	int      transport;             /* VU9P_TRANSPORT_BRIDGE or VU9P_TRANSPORT_JTAG */
+	void    *jtag;                  /* native JTAG state (platform/vu9p_jtag.c) */
 	bool     own_bridge;            /* we spawned the vivado_lab bridge */
 	pid_t    bridge_pid;
 	int      fd;
@@ -51,6 +57,7 @@ struct vu9p_tools {
 	const char *hw_server;          /* host:port of the Xilinx hw_server, default 127.0.0.1:3121 */
 	const char *log_dir;            /* where bridge/program logs go */
 	int      io_timeout_ms;         /* per-command bridge timeout */
+	int      tck_hz;                /* native JTAG clock (default 15 MHz) */
 };
 
 extern struct vu9p_dev g_vu9p_devs[VU9P_MAX_DEVICES];
