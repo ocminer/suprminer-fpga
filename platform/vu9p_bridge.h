@@ -6,7 +6,8 @@
  * registers their meaning.  Device specs come from --device, never from code:
  *   host:port             connect to a bridge somebody already started
  *   jtag:SERIAL[:port]    start a bridge for the board with that JTAG serial
- *                         (port defaults to 13400 + device index)
+ *                         (port defaults to 13400 + device index); a bridge
+ *                         already answering on that port is reused
  */
 #ifndef VU9P_BRIDGE_H
 #define VU9P_BRIDGE_H

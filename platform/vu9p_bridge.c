@@ -152,6 +152,16 @@ int vu9p_spawn_bridge(struct vu9p_dev *d, const struct vu9p_tools *t)
 	int i;
 
 	if (!d->own_bridge) return 0;
+	/* a bridge that already answers on this port (left by a previous run or started by hand) is reused */
+	{
+		int fd = try_connect(d, 2000);
+		if (fd >= 0) {
+			close(fd);
+			applog(LOG_INFO, "VU9P %d: a bridge already listens on %s:%d, reusing it", d->index, d->host, d->port);
+			d->own_bridge = false;
+			return 0;
+		}
+	}
 	snprintf(logfile, sizeof(logfile), "%s/vu9p_bridge_%s.log", tool_path(t->log_dir, "."), d->serial);
 	snprintf(portstr, sizeof(portstr), "%d", d->port);
 	applog(LOG_INFO, "VU9P %d: starting JTAG-AXI bridge for %s on port %d (log %s)", d->index, d->serial, d->port, logfile);
