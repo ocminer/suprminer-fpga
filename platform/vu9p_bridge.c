@@ -10,6 +10,7 @@
  * core (run=0) so a dead host never leaves a board searching.
  */
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -119,7 +120,7 @@ static int run_vivado_lab(const struct vu9p_tools *t, const char *tcl, const cha
 
 int vu9p_program(struct vu9p_dev *d, const char *bitstream, const struct vu9p_tools *t)
 {
-	char logfile[512], bitpath[1024];
+	char logfile[512], bitpath[PATH_MAX];
 	pid_t pid; int status;
 
 	if (d->transport == VU9P_TRANSPORT_JTAG) {
