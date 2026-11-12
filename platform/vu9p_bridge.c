@@ -336,8 +336,12 @@ void vu9p_close(struct vu9p_dev *d)
 	}
 	pthread_mutex_unlock(&d->lock);
 	if (d->own_bridge && d->bridge_pid > 0) {
+		/* vivado_lab sits in a Tcl event loop and may ignore SIGTERM: escalate to SIGKILL after 3 s,
+		 * otherwise the bridge keeps the hardware target open and blocks the next programming run */
+		int i, status;
 		kill(d->bridge_pid, SIGTERM);
-		waitpid(d->bridge_pid, NULL, 0);
+		for (i = 0; i < 30 && waitpid(d->bridge_pid, &status, WNOHANG) == 0; i++) usleep(100000);
+		if (i == 30) { kill(d->bridge_pid, SIGKILL); waitpid(d->bridge_pid, NULL, 0); }
 		d->bridge_pid = 0;
 	}
 }
