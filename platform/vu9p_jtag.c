@@ -18,6 +18,7 @@
 #define IR_BITS      6                /* per SLR; an SSI device presents 6 bits per SLR (XCVU9P: 18) */
 #define IR_IDCODE    0x09
 #define IR_USER1     0x02
+#define IR_USER2     0x03
 #define IR_JPROGRAM  0x0B
 #define IR_CFG_IN    0x05
 #define IR_JSTART    0x0C
@@ -34,7 +35,8 @@ struct vu9p_jtag {
 	int  user1_loaded;
 	uint8_t ack;                      /* last seen ack counter */
 	int  nslr;                        /* IR fields (SLRs) on the chain, from the IDCODE */
-	int  bus_field;                   /* IR field whose USER1 answers with the register bus magic */
+	int  bus_field;                   /* IR field whose USERx answers with the register bus magic */
+	uint32_t bus_ir;                  /* IR_USER2 (dual-mode images) or IR_USER1 (first native image) */
 };
 
 /* Measured on an XCVU9P (3 SLRs): the IR is 18 bits = 3 fields of 6, the field shifted in LAST (highest
@@ -90,7 +92,7 @@ static int ensure_user1(struct vu9p_dev *d)
 	struct vu9p_jtag *j = J(d);
 	uint32_t cap = 0;
 	if (j->user1_loaded) return 0;
-	if (jtag_scan_ir(&j->m, ir_word(j, IR_USER1, j->bus_field), ir_len(j), &cap)) { fail(d); return -1; }
+	if (jtag_scan_ir(&j->m, ir_word(j, j->bus_ir ? j->bus_ir : IR_USER2, j->bus_field), ir_len(j), &cap)) { fail(d); return -1; }
 	if ((cap & 0x3) != 0x1) { applog(LOG_ERR, "VU9P %d: unexpected IR capture %05x (no FPGA on the chain?)", d->index, cap); fail(d); return -1; }
 	j->user1_loaded = 1;
 	return 0;
@@ -203,19 +205,21 @@ int vu9p_jtag_check_bus(struct vu9p_dev *d)
 {
 	struct vu9p_jtag *j = J(d);
 	uint32_t magic = 0;
-	int f, n = j->nslr > 0 ? j->nslr : 1;
-	/* the BSCANE2 of the design may sit in any SLR: try the master field first, then the others */
-	for (f = 0; f < n; f++) {
+	int f, n = j->nslr > 0 ? j->nslr : 1, u;
+	static const uint32_t users[2] = { IR_USER2, IR_USER1 };
+	/* dual-mode images carry the bus on USER2 (USER1 belongs to the Vivado debug hub), the first native image on
+	 * USER1; the BSCANE2 may sit in any SLR: try the master field first, then the others */
+	for (u = 0; u < 2; u++) for (f = 0; f < n; f++) {
 		int field = (master_field(j) + n - f) % n;
-		j->bus_field = field; j->user1_loaded = 0;
+		j->bus_ir = users[u]; j->bus_field = field; j->user1_loaded = 0;
 		if (vu9p_jtag_rd(d, VU9P_JTAG_REG_MAGIC, &magic) == 0 && magic == VU9P_JTAG_MAGIC) {
-			if (field != master_field(j)) applog(LOG_INFO, "VU9P %d: register bus found on IR field %d", d->index, field);
+			applog(LOG_INFO, "VU9P %d: register bus on USER%d, IR field %d", d->index, users[u] == IR_USER2 ? 2 : 1, field);
 			return 0;
 		}
 		if (d->fd < 0) return -1;      /* transport failure, not a missing bus */
 	}
-	j->bus_field = master_field(j); j->user1_loaded = 0;
-	applog(LOG_ERR, "VU9P %d: no register bus on USER1 (last read %08x, expected %08x): is a native-JTAG bitstream loaded? (--program)",
+	j->bus_ir = IR_USER2; j->bus_field = master_field(j); j->user1_loaded = 0;
+	applog(LOG_ERR, "VU9P %d: no register bus on USER2/USER1 (last read %08x, expected %08x): is a native-JTAG bitstream loaded? (--program)",
 	       d->index, magic, VU9P_JTAG_MAGIC);
 	return -1;
 }
