@@ -58,6 +58,7 @@ set(SRC_LIST fpga-miner.c
 		./platform/vu9p_jtag.c
 		./platform/vu9p_proxima.c
 		./platform/vu9p_sha3t.c
+		./platform/vu9p_voltage.c
 		./algo/proxima.c
 		tui.c
 		util.c
@@ -118,6 +119,11 @@ add_test(NAME ztex_rb_helpers COMMAND ztex_rb_test_test)
 # perturbing the production miner target during a normal build.
 add_executable(hashrate_total_test EXCLUDE_FROM_ALL hashrate_total_test.c)
 add_test(NAME hashrate_total COMMAND hashrate_total_test)
+
+# Pure host checks for the VU9P VCCINT helpers (NextJTAG output parser, FTDI serial).
+add_executable(vu9p_voltage_test EXCLUDE_FROM_ALL vu9p_voltage_test.c)
+target_link_libraries(vu9p_voltage_test m)
+add_test(NAME vu9p_voltage COMMAND vu9p_voltage_test)
 
 # Pure host regression for the SHA3T successor contract: nonce zero is checked
 # on an immutable private copy and work identity includes the full target.

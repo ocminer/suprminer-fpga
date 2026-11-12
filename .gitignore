@@ -111,6 +111,7 @@
 !/hash_test.c
 !/hashrate_total.h
 !/hashrate_total_test.c
+!/vu9p_voltage_test.c
 !/libvu9p.c
 !/libvu9p.h
 !/libvu9p_test.c
@@ -129,6 +130,8 @@
 !/platform/vu9p_jtag.c
 !/platform/vu9p_jtag.h
 !/platform/vu9p_program.tcl
+!/platform/vu9p_voltage.c
+!/platform/vu9p_voltage.h
 !/platform/vu9p_proxima.c
 !/platform/vu9p_sha3t.c
 !/proof_of_concept/README.md

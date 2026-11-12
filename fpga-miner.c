@@ -83,6 +83,7 @@
 #include "algo_table.h"
 #include "platform/vu9p_bridge.h"
 #include "platform/vu9p_driver.h"
+#include "platform/vu9p_voltage.h"
 
 static int proxima_submit_append_hash(json_t *params, const struct work *work);
 
@@ -527,6 +528,10 @@ extern uint64_t opt_vu9p_epoch;
 int   opt_tck_khz = 0;
 int   opt_vu9p_mode = VU9P_TRANSPORT_BRIDGE;     /* --vu9p-mode bridge (default) | direct */
 bool  opt_program_only = false;                  /* --program-only: load the bitstream and exit */
+double opt_vu9p_voltage = VU9P_VCCINT_DEFAULT;   /* --vu9p-voltage: VCCINT set before programming, 0 = leave alone */
+bool  opt_vu9p_voltage_set = false;
+char *opt_nextjtag = NULL;                       /* --nextjtag: NextJTAG executable */
+char *opt_nextjtag_license = NULL;               /* --nextjtag-license: NEXTJTAG_LICENSE file */
 static bool opt_vu9p_build_id_set = false;
 static bool opt_vu9p_options_seen = false;
 static uint32_t opt_vu9p_build_id = 0;
@@ -626,6 +631,12 @@ FPGA platform selection (register-bridge backend) ----------------------------\n
       --tck-khz <n>          Direct mode JTAG clock in kHz (default 15000)\n\
       --program              VU9P: load the bitstream over JTAG before mining\n\
       --program-only         VU9P: load the bitstream and exit (e.g. park a board on a blank image)\n\
+      --vu9p-voltage <V>     VU9P: core voltage VCCINT set through NextJTAG and the board BMC before programming\n\
+                             (default 0.720, 0 = leave unchanged). Kept until the board is power cycled, so it is\n\
+                             written once per boot. NextJTAG needs the cable to itself (in bridge mode the\n\
+                             hw_server must not hold it); without NextJTAG the default is skipped with a warning\n\
+      --nextjtag <path>      NextJTAG executable (default: nextjtag in PATH)\n\
+      --nextjtag-license <f> NEXTJTAG_LICENSE file for NextJTAG (default: inherit the environment)\n\
       --selftest             Run the algorithm's known-answer test on every device and exit\n\
       --vivado-lab <path>    vivado_lab executable (default: $VIVADO_LAB or PATH)\n\
       --hw-server <host:port> Xilinx hw_server (default 127.0.0.1:3121)\n\
@@ -712,6 +723,9 @@ static struct option const options[] = {
 	{ "tck-khz", 1, NULL, 1085 },
 	{ "vu9p-mode", 1, NULL, 1086 },
 	{ "program-only", 0, NULL, 1087 },
+	{ "vu9p-voltage", 1, NULL, 1088 },
+	{ "nextjtag", 1, NULL, 1089 },
+	{ "nextjtag-license", 1, NULL, 1090 },
 	{ "auto-freq", 0, NULL, 1004 },
 	{ "watts-per-fpga", 1, NULL, 1008 },
 	{ "tui", 0, NULL, 1040 },
@@ -3635,6 +3649,16 @@ void parse_arg(int key, char *arg)
 	case 1084: opt_vu9p_epoch = strtoull(arg, NULL, 0); break;
 	case 1085: opt_tck_khz = atoi(arg); break;
 	case 1087: opt_program = true; opt_program_only = true; break;
+	case 1088:
+		opt_vu9p_voltage = atof(arg);
+		if (opt_vu9p_voltage != 0 && (opt_vu9p_voltage < VU9P_VCCINT_MIN || opt_vu9p_voltage > VU9P_VCCINT_MAX)) {
+			fprintf(stderr, "--vu9p-voltage %s: use 0 (unchanged) or %.3f-%.3f V\n", arg, VU9P_VCCINT_MIN, VU9P_VCCINT_MAX);
+			show_usage_and_exit(1);
+		}
+		opt_vu9p_voltage_set = true;
+		break;
+	case 1089: free(opt_nextjtag); opt_nextjtag = strdup(arg); break;
+	case 1090: free(opt_nextjtag_license); opt_nextjtag_license = strdup(arg); break;
 	case 1086:			/* --vu9p-mode bridge|direct */
 		if (!strcasecmp(arg, "bridge")) opt_vu9p_mode = VU9P_TRANSPORT_BRIDGE;
 		else if (!strcasecmp(arg, "direct") || !strcasecmp(arg, "native")) opt_vu9p_mode = VU9P_TRANSPORT_JTAG;
@@ -7969,6 +7993,7 @@ static const char *vu9p_bitstream_path(void)
 static int vu9p_setup(const char *argv0)
 {
 	int i, fails = 0;
+	struct vu9p_voltage_tools vt;
 
 	vu9p_driver = algo_table[opt_algo].vu9p_driver;
 	if (!vu9p_driver) {
@@ -7989,6 +8014,16 @@ static int vu9p_setup(const char *argv0)
 	g_vu9p_tools.log_dir = opt_log_dir ? opt_log_dir : ".";
 	g_vu9p_tools.io_timeout_ms = 30000;
 	g_vu9p_tools.tck_hz = opt_tck_khz > 0 ? opt_tck_khz * 1000 : 15000000;
+	vt.nextjtag = opt_nextjtag;
+	vt.license = opt_nextjtag_license;
+	vt.log_dir = g_vu9p_tools.log_dir;
+	vt.state_dir = NULL;
+
+	if (!opt_program && opt_vu9p_voltage > 0)
+		for (i = 0; i < g_vu9p_count; i++)
+			if (g_vu9p_devs[i].serial[0] && !vu9p_vccint_is_set(&g_vu9p_devs[i], opt_vu9p_voltage, &vt))
+				applog(LOG_NOTICE, "VU9P %d: VCCINT %.3f V not recorded since this boot; it is set together with --program",
+				       i, opt_vu9p_voltage);
 
 	if (opt_program) {
 		const char *bit = vu9p_bitstream_path();
@@ -7997,10 +8032,19 @@ static int vu9p_setup(const char *argv0)
 			return -1;
 		}
 		/* program every board before any bridge is opened: a JTAG programming
-		 * session stalls the other boards' bridges on the same hw_server */
-		for (i = 0; i < g_vu9p_count; i++)
+		 * session stalls the other boards' bridges on the same hw_server.
+		 * VCCINT first: NextJTAG's BMC setup may load a helper image. */
+		for (i = 0; i < g_vu9p_count; i++) {
+			if (opt_vu9p_voltage > 0 && g_vu9p_devs[i].serial[0]) {
+				int vr = vu9p_set_vccint(&g_vu9p_devs[i], opt_vu9p_voltage, &vt);
+				/* an explicit --vu9p-voltage must take effect; the default is best effort,
+				 * but a NextJTAG run that did not confirm leaves the board unknown */
+				if (vr == VU9P_VCCINT_FAILED || (vr < 0 && opt_vu9p_voltage_set))
+					return -1;
+			}
 			if (vu9p_program(&g_vu9p_devs[i], bit, &g_vu9p_tools))
 				return -1;
+		}
 		if (opt_program_only) {
 			applog(LOG_INFO, "programmed %d device%s, exiting (--program-only)", g_vu9p_count, g_vu9p_count == 1 ? "" : "s");
 			vu9p_shutdown_all();

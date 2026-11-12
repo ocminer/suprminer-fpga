@@ -50,6 +50,8 @@ operator. Never copy a command without replacing its placeholders.
 --vu9p-mode MODE       bridge (default, vivado_lab bridge per board) or direct (FTDI cable driven by the miner)
 --device LIST          VU9P boards: SERIAL[:port] per mode, or explicit ftdi:SERIAL, host:port, jtag:SERIAL[:port]
 --program              VU9P: load the bitstream over JTAG before mining
+--vu9p-voltage V       VU9P: core voltage (VCCINT) set through NextJTAG before programming, default 0.720, 0 = unchanged
+--nextjtag PATH        NextJTAG executable (default: nextjtag in PATH); --nextjtag-license FILE sets NEXTJTAG_LICENSE
 --selftest             Run the algorithm's known-answer test and exit
 --api-bind 0          Disable the optional miner API
 --tui                 Interactive ZTEX device table and miner log
@@ -112,6 +114,29 @@ whichever SLR holds it.
 ```sh
 ./suprminer-fpga -a proxima --fpga vu9p --device ftdi:SERIALA --bitstream /path/to/proxima.bit --program --selftest
 ```
+
+### Core voltage (VCCINT)
+
+When it programs a VU9P board (`--program`, `--program-only`), the miner first sets the core voltage
+through [NextJTAG](https://github.com/NextDesignSolutions/NextJtag) and the board BMC
+(BCU-1525 and similar): `--vu9p-voltage 0.720` is the default, `0` leaves the voltage alone.
+Both regulator phases must read back within 5 mV, otherwise the miner stops before programming.
+0.720 V is AMD's low-voltage operating point (VCCINT 0.698-0.742 V); check that your image
+meets timing there.
+
+The board keeps the setpoint until it is power cycled, so the miner writes it once per boot and
+records that in `$XDG_RUNTIME_DIR/suprminer-fpga/` (or `/run/user/<uid>/suprminer-fpga/`). NextJTAG's
+BMC setup may load a helper image, which is why the voltage is set right before the bitstream.
+
+NextJTAG needs the board's cable to itself. In bridge mode a running Xilinx `hw_server` holds every
+cable, so set the voltage in direct mode with `hw_server` stopped, then start mining in bridge mode:
+
+```sh
+./suprminer-fpga -a proxima --fpga vu9p --vu9p-mode direct --device SERIALA --bitstream proxima.bit --program-only --vu9p-voltage 0.720
+```
+
+Without NextJTAG, or with the cable held by another program, the default is skipped with a warning;
+an explicit `--vu9p-voltage` stops instead.
 
 ### Proxima (txid-blake2b)
 
