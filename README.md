@@ -102,8 +102,12 @@ involved. The bitstream must contain the USER1 register bus (the b2b images
 built with `JTAG_NATIVE=1`); the `jtag:SERIAL` / `host:port` specs keep working
 for bitstreams that carry the Xilinx JTAG-to-AXI core. The cable must not be
 held by another program (stop Vivado's `hw_server` first). `--tck-khz` sets the
-JTAG clock (default 15000). Status of this release: implemented and unit-built;
-hardware qualification on BCU-1525 boards is pending.
+JTAG clock (default 15000). Qualified on a BCU-1525 (XCVU9P): programming a
+64 MB image takes about 40 s at 15 MHz, the built-in Proxima test passes, and a
+mainnet run accepted 48 of 48 shares at the full core rate with 0 hardware
+errors. The XCVU9P exposes an 18-bit instruction register (6 bits per SLR); the
+driver addresses the configuration master field and finds the register bus on
+whichever SLR holds it.
 
 ```sh
 ./suprminer-fpga -a proxima --fpga vu9p --device ftdi:SERIALA --bitstream /path/to/proxima.bit --program --selftest
