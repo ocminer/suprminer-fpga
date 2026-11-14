@@ -7,6 +7,8 @@ The repository includes two BC3 (triple SHA3-256) proof-of-concept releases:
 - [VU9P single-core / 300-MHz bitstream and reference RTL](proof_of_concept/vu9p/README.md).
 
 ZTEX uses USB. VU9P uses an explicitly selected, loopback-only JTAG-AXI bridge.
+A ZTEX Proxima (txid-blake2b) proof-of-concept bitstream is bundled; see
+"Proxima on ZTEX 1.15y" below. Faster images for ZTEX and other platforms are available on request.
 The host also contains Groestl, Myriad-Groestl, Blake256-8, BLAKE3 and
 txid-blake2b (Proxima) algorithm support; compatible images for those
 algorithms are not included.
@@ -76,7 +78,8 @@ their meaning:
 | groestl, myr-gr, blakecoin, vcash, blake3, odo | ztex | see `bitstreams/README.md` | ZTEX USB backend |
 | sha3t | ztex | `ztex_sha3.bit` | ZTEX USB backend |
 | sha3t | vu9p | `vu9p_sha3t.bit` (not bundled) | `platform/vu9p_sha3t.c` (BS1 register map; the `--vu9p` backend remains for the published proof of concept) |
-| proxima | vu9p | `vu9p_proxima.bit` (not bundled yet) | `platform/vu9p_proxima.c` |
+| proxima | ztex | `ztex_proxima.bit` (bundled proof of concept, 100 MHz) | `platform/ztex_proxima.c` |
+| proxima | vu9p | `vu9p_proxima.bit` (not bundled, available on request) | `platform/vu9p_proxima.c` |
 
 Device specs are given on the command line only: `host:port` connects to a
 bridge somebody already started, `jtag:SERIAL[:port]` makes the miner start one
@@ -164,7 +167,30 @@ The miner never submits before the pool has sent a difficulty.
 `--kmin` limits the hit rate the board reports (default 2^27 per hit), `--tmax`
 is the thermal stop (default 85 C, resume 5 C lower). The miner prints the
 measured counter rate, verified hits and hardware errors every 30 seconds.
-A Proxima demo bitstream is a separate release decision; none is included yet.
+### Proxima on ZTEX 1.15y (Spartan-6) boards
+
+`bitstreams/ztex_proxima.bit` is a **proof of concept** for the ZTEX USB-FPGA 1.15y (4 x XC6SLX150-3): one
+quarter-rate BLAKE2b-256 search core per FPGA at 100 MHz, 25 MH/s per FPGA (0.1 GH/s per quad board). It uses the
+same FX2 USB protocol as the other ZTEX images (job frame via vendor request 0x80, 16-byte hit/status records via
+0x81); `platform/ztex_proxima.c` is its driver and plugs into the same algorithm-driver interface as the VU9P
+drivers, so stratum handling, share verification and statistics are shared.
+
+```sh
+# program all FPGAs of all attached boards, run the known-answer self-test on each, exit
+./suprminer-fpga -a proxima --fpga ztex --program --selftest
+
+# mine on every attached board (restrict with --device SERIAL1,SERIAL2 and/or FPGA_ONLY=0123)
+./suprminer-fpga -a proxima --fpga ztex --account my-account.json --worker rig1 \
+    --user-agent ProxiChorizo/2.0.1-fpga -o stratum+tcp://POOL:PORT
+```
+
+The host paces the FX2 control-endpoint traffic of each board to one transaction per millisecond; without that the
+FX2 occasionally answers a readback with a short packet after the FPGA has already popped the record, and the
+hit is lost. Every reported hit is re-hashed on the host before it is submitted. The 100 MHz image is the ceiling
+of this particular quarter-rate core on the LX150 (102 and 104 MHz failed timing; denser cores do not route).
+
+Faster bitstreams, for the ZTEX boards as well as for other platforms (VU9P/BCU-1525 and others), are available
+on request; the bundled image is the proof of concept. Contact the repository owner.
 
 ### SHA3-256t (BC3) through the register bridge
 

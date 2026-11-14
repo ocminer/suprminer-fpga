@@ -244,6 +244,7 @@ out:
 int vu9p_rd(struct vu9p_dev *d, uint32_t addr, uint32_t *val)
 {
 	char cmd[32], resp[64];
+	if (d->transport == VU9P_TRANSPORT_ZTEX) return -1;
 	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_rd(d, addr, val);
 	snprintf(cmd, sizeof(cmd), "R %03x", addr);
 	if (bridge_cmd(d, cmd, resp, sizeof(resp))) return -1;
@@ -254,6 +255,7 @@ int vu9p_rd(struct vu9p_dev *d, uint32_t addr, uint32_t *val)
 int vu9p_wr(struct vu9p_dev *d, uint32_t addr, uint32_t val)
 {
 	char cmd[48], resp[64];
+	if (d->transport == VU9P_TRANSPORT_ZTEX) return -1;
 	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_wr(d, addr, val);
 	snprintf(cmd, sizeof(cmd), "W %03x %08x", addr, val);
 	return bridge_cmd(d, cmd, resp, sizeof(resp));
@@ -263,6 +265,7 @@ int vu9p_rb(struct vu9p_dev *d, uint32_t addr, uint32_t *vals, int n)
 {
 	char cmd[32], resp[64 * 9 + 16], *p;
 	int i;
+	if (d->transport == VU9P_TRANSPORT_ZTEX) return -1;
 	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_rb(d, addr, vals, n);
 	if (n > 64) return -1;
 	snprintf(cmd, sizeof(cmd), "RB %03x %d", addr, n);
@@ -279,6 +282,7 @@ int vu9p_rb(struct vu9p_dev *d, uint32_t addr, uint32_t *vals, int n)
 
 int vu9p_wb(struct vu9p_dev *d, uint32_t addr, const uint32_t *vals, int n)
 {
+	if (d->transport == VU9P_TRANSPORT_ZTEX) return -1;
 	int i, j;
 	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_wb(d, addr, vals, n);
 	for (i = 0; i < n; i += 32) {        /* keep lines short */
@@ -294,6 +298,7 @@ int vu9p_wb(struct vu9p_dev *d, uint32_t addr, const uint32_t *vals, int n)
 int vu9p_sensors(struct vu9p_dev *d)
 {
 	char resp[160], *p;
+	if (d->transport == VU9P_TRANSPORT_ZTEX) return -1;      /* no sensor on the 1.15y */
 	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_sensors(d);
 	if (bridge_cmd(d, "TEMP", resp, sizeof(resp))) return -1;
 	if ((p = strstr(resp, "C="))) d->temp_c = atof(p + 2);
@@ -314,6 +319,7 @@ int vu9p_ping(struct vu9p_dev *d, uint32_t *id)
 int vu9p_connect(struct vu9p_dev *d, const struct vu9p_tools *t)
 {
 	int fd;
+	if (d->transport == VU9P_TRANSPORT_ZTEX) return 0;
 	if (d->transport == VU9P_TRANSPORT_JTAG) return vu9p_jtag_open(d, t->tck_hz);
 	fd = try_connect(d, t->io_timeout_ms > 0 ? t->io_timeout_ms : 30000);
 	if (fd < 0) { applog(LOG_ERR, "VU9P %d: cannot connect to bridge %s:%d", d->index, d->host, d->port); return -1; }
@@ -326,6 +332,7 @@ int vu9p_connect(struct vu9p_dev *d, const struct vu9p_tools *t)
 
 void vu9p_close(struct vu9p_dev *d)
 {
+	if (d->transport == VU9P_TRANSPORT_ZTEX) return;       /* USB handles stay with libztex */
 	if (d->transport == VU9P_TRANSPORT_JTAG) { vu9p_jtag_close(d); return; }
 	pthread_mutex_lock(&d->lock);
 	if (d->fd >= 0) {

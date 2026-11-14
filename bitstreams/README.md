@@ -11,7 +11,8 @@ are listed in `algo_table.c`; any file can be used with `--bitstream <path>`.
 | ztex | blake3 | blake3_dcr.bit | |
 | ztex | odo | odo_dgb.bit | |
 | ztex | sha3t | ztex_sha3.bit | variant ladder ztex_sha3_<MHz>.bit optional |
-| vu9p | proxima | vu9p_proxima.bit | not bundled yet (separate release decision) |
+| ztex | proxima | ztex_proxima.bit | bundled proof of concept: XC6SLX150, 1 core, 100 MHz, 25 MH/s per FPGA (see README) |
+| vu9p | proxima | vu9p_proxima.bit | not bundled (available on request) |
 | vu9p | sha3t | vu9p_sha3t.bit | not bundled |
 
 A VU9P bitstream must expose one JTAG-AXI master (hw_axi) with the register map its driver in

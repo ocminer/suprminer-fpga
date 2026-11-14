@@ -62,6 +62,7 @@ struct vu9p_algo_driver {
 
 extern const struct vu9p_algo_driver vu9p_proxima_driver;
 extern const struct vu9p_algo_driver vu9p_sha3t_driver;
+extern const struct vu9p_algo_driver ztex_proxima_driver;     /* platform/ztex_proxima.c: ZTEX 1.15y b2b images */
 
 /* Tunables the drivers may read (set from the command line). */
 extern int    opt_vu9p_kmin;     /* minimum hardware difficulty (hit-rate limiter) */

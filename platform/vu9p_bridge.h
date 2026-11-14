@@ -20,9 +20,10 @@
 #include <pthread.h>
 #include <sys/types.h>
 
-#define VU9P_MAX_DEVICES   16
+#define VU9P_MAX_DEVICES   128      /* ZTEX: one entry per FPGA (25 boards x 4) */
 #define VU9P_TRANSPORT_BRIDGE 0     /* host:port or jtag:SERIAL  -> vivado_lab JTAG-AXI bridge */
 #define VU9P_TRANSPORT_JTAG   1     /* ftdi:SERIAL -> the miner drives the FTDI cable itself (no bridge) */
+#define VU9P_TRANSPORT_ZTEX   2     /* one FPGA of a ZTEX USB-FPGA 1.15y board (libztex, EP0 frame/record protocol) */
 #define VU9P_SPEC_LEN      128
 #define VU9P_BRIDGE_BASE_PORT 13400
 
@@ -34,6 +35,10 @@ struct vu9p_dev {
 	char     serial[48];            /* empty when connecting to an external bridge */
 	int      transport;             /* VU9P_TRANSPORT_BRIDGE or VU9P_TRANSPORT_JTAG */
 	void    *jtag;                  /* native JTAG state (platform/vu9p_jtag.c) */
+	void    *ztex;                  /* VU9P_TRANSPORT_ZTEX: struct libztex_device of the board */
+	int      ztex_fpga;             /* VU9P_TRANSPORT_ZTEX: FPGA index on that board */
+	pthread_mutex_t *bus_lock;      /* VU9P_TRANSPORT_ZTEX: shared by the FPGAs of one board (select + transfer) */
+	char     label[40];             /* log prefix: "VU9P 0", "ZTEX <serial>/<fpga>" */
 	bool     own_bridge;            /* we spawned the vivado_lab bridge */
 	pid_t    bridge_pid;
 	int      fd;

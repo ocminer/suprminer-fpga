@@ -13,6 +13,7 @@ import sys
 PUBLIC_ASSETS = {
     "api/API.class": "5dd6c5a2f9d161756c1ce778f8835277928a47fdf739b3459689a30e079334f0",
     "bitstreams/ztex_ufm1_15y1.bin": "911b8032a5e2381f1079b7469bd1838bcc8980e340b655476c12f2ab0835535d",
+    "bitstreams/ztex_proxima.bit": "fa267619e7eeebe2b6f4d380c234b8fb5da8a19ad08c8bdcdc14ff88866b1e66",
     "proof_of_concept/vu9p/bc3_vu9p_bs1_300mhz.bit": "659ed0b524d3ed22567903e98fa26e9a7d0cfea87efb3e70c147db7442fe4cb2",
     "proof_of_concept/ztex_sha3_10core_90mhz.bit": "75517beca0628fcc315a8c30bb13797f6849ec77b4ed0a2c2ef8de618d08dda9",
 }

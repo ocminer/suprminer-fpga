@@ -622,15 +622,16 @@ Options:\n\
 FPGA platform selection (register-bridge backend) ----------------------------\n\n\
       --fpga <platform>      Board family: ztex or vu9p (VU9P = BCU-1525 and similar, JTAG-AXI bridge)\n\
       --bitstream <file>     Bitstream to use instead of the algorithm's default (path or name under bitstreams/)\n\
-      --device <list>        VU9P boards, comma separated: ftdi:SERIAL (native: the miner drives the FTDI\n\
+      --device <list>        ZTEX: board serials to use (default: all boards; lanes via FPGA_ONLY=0123)\n\
+                             VU9P boards, comma separated: ftdi:SERIAL (native: the miner drives the FTDI\n\
                              JTAG cable, no Vivado), host:port of a running bridge, or jtag:SERIAL[:port]\n\
                              to start a vivado_lab bridge for that serial (port = 13400 + index)\n\
       --vu9p-mode <m>        bridge (default): bare serials use a vivado_lab JTAG-AXI bridge, hw_server keeps the\n\
                              cables (temperature guardians keep working); direct: the miner drives the FTDI\n\
                              cable itself (no Vivado at all, cable must be free)\n\
       --tck-khz <n>          Direct mode JTAG clock in kHz (default 15000)\n\
-      --program              VU9P: load the bitstream over JTAG before mining\n\
-      --program-only         VU9P: load the bitstream and exit (e.g. park a board on a blank image)\n\
+      --program              Load the bitstream before mining (ZTEX: every selected FPGA over USB; VU9P: JTAG)\n\
+      --program-only         Load the bitstream and exit (e.g. park a board on a blank image)\n\
       --vu9p-voltage <V>     VU9P: core voltage VCCINT set through NextJTAG and the board BMC before programming\n\
                              (default 0.720, 0 = leave unchanged). Kept until the board is power cycled, so it is\n\
                              written once per boot. NextJTAG needs the cable to itself (in bridge mode the\n\
@@ -642,7 +643,7 @@ FPGA platform selection (register-bridge backend) ----------------------------\n
       --hw-server <host:port> Xilinx hw_server (default 127.0.0.1:3121)\n\
       --tcl-dir <dir>        Directory with vu9p_bridge.tcl / vu9p_program.tcl (default: <exe dir>/platform)\n\
       --log-dir <dir>        Where bridge and programming logs go (default .)\n\
-      --kmin <bits>          VU9P: minimum hardware difficulty 2^bits (hit-rate limiter, default 27)\n\
+      --kmin <bits>          Proxima: minimum hardware difficulty 2^bits (hit-rate limiter, default 27)\n\
       --tmax <C>             VU9P: stop a board above this temperature, resume 5 C lower (default 85)\n\
       --epoch <hashes>       VU9P: hashes per work item before fresh work is requested (32-bit nonce cores)\n\
       --user-agent <s>       User agent sent in mining.subscribe (some pools gate on it)\n\
@@ -8006,6 +8007,8 @@ static int vu9p_setup(const char *argv0)
 	}
 	if (vu9p_parse_devices(opt_device, opt_vu9p_mode) <= 0)
 		return -1;
+	for (i = 0; i < g_vu9p_count; i++)
+		snprintf(g_vu9p_devs[i].label, sizeof(g_vu9p_devs[i].label), "VU9P %d", i);
 	applog(LOG_INFO, "VU9P mode: %s (%d device%s)", opt_vu9p_mode == VU9P_TRANSPORT_JTAG ? "direct (FTDI JTAG, no bridge)" :
 	       "bridge (vivado_lab JTAG-AXI bridge, hw_server keeps the cables)", g_vu9p_count, g_vu9p_count == 1 ? "" : "s");
 	g_vu9p_tools.vivado_lab = opt_vivado_lab ? opt_vivado_lab : getenv("VIVADO_LAB");
@@ -8076,6 +8079,144 @@ static int vu9p_setup(const char *argv0)
 	return 0;
 }
 
+/* ---- ZTEX boards through the algorithm-driver interface (--fpga ztex, algorithm with a ztex_driver) ----
+ * One device entry per FPGA; the four FPGAs of a board share the USB handle and a bus lock.  --device
+ * optionally lists board serials, FPGA_ONLY optionally lists lane digits (e.g. FPGA_ONLY=0123).  --program
+ * configures every selected FPGA with the bitstream first; otherwise unconfigured FPGAs are skipped. */
+static bool ztex_serial_selected(const char *serial)
+{
+	const char *p = opt_device;
+	size_t n = strlen(serial);
+	if (!p || !*p) return true;
+	while (*p) {
+		const char *e = strchr(p, ',');
+		size_t len = e ? (size_t)(e - p) : strlen(p);
+		if (len == n && !strncmp(p, serial, n)) return true;
+		if (!e) break;
+		p = e + 1;
+	}
+	return false;
+}
+
+static bool ztex_lane_configured(struct libztex_device *z)
+{
+	unsigned char buf[9];
+	int t, rc;
+	for (t = 0; t < 3; t++) {          /* right after a select the FX2 occasionally answers for the old lane */
+		usleep(5000);
+		rc = libusb_control_transfer(z->hndl, 0xc0, 0x30, 0, 0, buf, 9, 1000);
+		if (rc >= 1 && buf[0] == 0) return true;
+	}
+	return false;
+}
+
+static int ztex_driver_setup(void)
+{
+	static pthread_mutex_t bus_locks[VU9P_MAX_DEVICES];
+	struct libztex_dev_list **devs = NULL;
+	const char *only = getenv("FPGA_ONLY");
+	const char *bit = opt_bitstream ? opt_bitstream : algo_table[opt_algo].ztex_bitstream;
+	static char bitpath[PATH_MAX];
+	int nboards, b, f, i, nb = 0, fails = 0, skipped = 0;
+
+	vu9p_driver = algo_table[opt_algo].ztex_driver;
+	if (!vu9p_driver) {
+		applog(LOG_ERR, "Algorithm %s has no ZTEX driver (see algo_table.c)", algo_names[opt_algo]);
+		return -1;
+	}
+	{
+		int err = libusb_init(NULL);      /* the classic ZTEX path initialises libusb later in main; this path runs first */
+		if (err) { applog(LOG_ERR, "libusb_init() failed (%d)", err); return -1; }
+	}
+	if (bit && access(bit, R_OK) != 0) {
+		snprintf(bitpath, sizeof(bitpath), "bitstreams/%s", bit);
+		bit = bitpath;
+	}
+	if (opt_program && (!bit || access(bit, R_OK) != 0)) {
+		applog(LOG_ERR, "--program: no readable bitstream for %s on ztex (pass --bitstream <file>)", algo_names[opt_algo]);
+		return -1;
+	}
+	nboards = libztex_scanDevices(&devs, opt_firmware);
+	if (nboards <= 0) {
+		applog(LOG_ERR, "no ZTEX boards found");
+		return -1;
+	}
+	for (b = 0; b < nboards; b++) {
+		struct libztex_device *z = devs[b]->dev;
+		if (!z) continue;
+		if (!ztex_serial_selected((const char *) z->snString)) {
+			applog(LOG_INFO, "%s: not in --device, skipped", z->repr);
+			continue;
+		}
+		z->numberOfFpgas = libztex_numberOfFpgas(z);
+		z->selectedFpga = -1;
+		pthread_mutex_init(&bus_locks[nb], NULL);
+		for (f = 0; f < z->numberOfFpgas; f++) {
+			struct vu9p_dev *d;
+			if (only && *only && !strchr(only, '0' + f)) continue;
+			if (g_vu9p_count >= VU9P_MAX_DEVICES) { applog(LOG_ERR, "more than %d FPGAs, rest ignored", VU9P_MAX_DEVICES); break; }
+			if (!libztex_selectFpga(z, f)) { fails++; continue; }
+			if (opt_program) {
+				applog(LOG_INFO, "%s FPGA %d: configuring %s", z->repr, f, bit);
+				if (!libztex_configureFpga(z, bit)) {
+					applog(LOG_ERR, "%s FPGA %d: configuration FAILED", z->repr, f);
+					fails++;
+					continue;
+				}
+			} else if (!ztex_lane_configured(z)) {
+				applog(LOG_WARNING, "%s FPGA %d: not configured, skipped (use --program)", z->repr, f);
+				skipped++;
+				continue;
+			}
+			d = &g_vu9p_devs[g_vu9p_count];
+			memset(d, 0, sizeof(*d));
+			d->index = g_vu9p_count;
+			d->transport = VU9P_TRANSPORT_ZTEX;
+			d->ztex = z;
+			d->ztex_fpga = f;
+			d->bus_lock = &bus_locks[nb];
+			d->fd = 0;                      /* >= 0: the driver thread's "bridge lost" check never fires */
+			d->enabled = true;
+			pthread_mutex_init(&d->lock, NULL);
+			snprintf(d->spec, sizeof(d->spec), "%s/%d", z->snString, f);
+			snprintf(d->label, sizeof(d->label), "ZTEX %s/%d", z->snString, f);
+			g_vu9p_count++;
+		}
+		nb++;
+	}
+	applog(LOG_INFO, "ZTEX: %d board%s, %d FPGA%s selected%s%s", nb, nb == 1 ? "" : "s", g_vu9p_count, g_vu9p_count == 1 ? "" : "s",
+	       skipped ? " (unconfigured skipped)" : "", fails ? " (errors, see above)" : "");
+	if (opt_program_only) {
+		applog(LOG_INFO, "programmed %d FPGA%s, exiting (--program-only)", g_vu9p_count, g_vu9p_count == 1 ? "" : "s");
+		exit(fails ? 1 : 0);
+	}
+	if (g_vu9p_count == 0) {
+		applog(LOG_ERR, "no configured ZTEX FPGA to mine on");
+		return -1;
+	}
+	for (i = 0; i < g_vu9p_count; i++) {
+		struct vu9p_dev *d = &g_vu9p_devs[i];
+		if (vu9p_driver->open(d)) {
+			applog(LOG_ERR, "%s: driver open failed (no status record: wrong bitstream, or the FPGA is not hashing a b2b image?)", d->label);
+			return -1;
+		}
+		if (vu9p_driver->build_id_mask && (d->build_id & vu9p_driver->build_id_mask) != vu9p_driver->build_id_value) {
+			applog(LOG_ERR, "%s: build id %08x is not a %s bitstream (expected %08x under mask %08x)",
+			       d->label, d->build_id, vu9p_driver->name, vu9p_driver->build_id_value, vu9p_driver->build_id_mask);
+			return -1;
+		}
+	}
+	if (opt_selftest) {
+		int sf = 0;
+		for (i = 0; i < g_vu9p_count; i++)
+			if (vu9p_driver->selftest(&g_vu9p_devs[i]))
+				sf++;
+		applog(sf ? LOG_ERR : LOG_INFO, "ZTEX selftest: %d of %d FPGAs failed", sf, g_vu9p_count);
+		exit(sf ? 1 : 0);
+	}
+	return 0;
+}
+
 static int vu9p_submit_cb(void *ctx, struct work *w)
 {
 	return submit_work((struct thr_info *) ctx, w) ? 0 : -1;
@@ -8109,7 +8250,7 @@ static void *vu9p_driver_thread(void *userdata)
 
 	memset(&work, 0, sizeof(work));
 	gettimeofday(&tv_stat, NULL);
-	applog(LOG_INFO, "VU9P %d: miner thread %d started, %s driver on %s", ci, thr_id, drv->name, dev->spec);
+	applog(LOG_INFO, "%s: miner thread %d started, %s driver on %s", dev->label, thr_id, drv->name, dev->spec);
 
 	while (1) {
 		bool fresh = false;
@@ -8118,7 +8259,7 @@ static void *vu9p_driver_thread(void *userdata)
 
 		if (dev->fd < 0) {
 			running = false; have_work = false;
-			applog(LOG_WARNING, "VU9P %d: bridge connection lost, reconnecting", ci);
+			applog(LOG_WARNING, "%s: bridge connection lost, reconnecting", dev->label);
 			vu9p_reconnect(dev);
 			continue;
 		}
@@ -8142,7 +8283,7 @@ static void *vu9p_driver_thread(void *userdata)
 					uint64_t done = 0;
 					if (drv->hashes(dev, &done) == 0 && done >= done_prev) done_total += done - done_prev;
 					drv->stop(dev); running = false;
-					applog(LOG_INFO, "VU9P %d: no stratum work, idle", ci);
+					applog(LOG_INFO, "%s: no stratum work, idle", dev->label);
 				}
 				have_work = false;
 				nmsleep(generated == STRATUM_GEN_WAIT ? 200 : 1000);
@@ -8176,7 +8317,7 @@ static void *vu9p_driver_thread(void *userdata)
 			if (drv->hashes(dev, &done) == 0 && done >= done_prev) done_total += done - done_prev;
 			drv->stop(dev);
 			running = false;
-			applog(LOG_INFO, "VU9P %d: job %s expired (pool ttl), idle until the next job", ci, work.job_id);
+			applog(LOG_INFO, "%s: job %s expired (pool ttl), idle until the next job", dev->label, work.job_id);
 		}
 		if (running) {
 			if (drv->poll(dev, &work, vu9p_submit_cb, mythr) < 0)
@@ -8198,10 +8339,10 @@ static void *vu9p_driver_thread(void *userdata)
 				if (dev->temp_c >= opt_vu9p_tmax && !hot) {
 					hot = true;
 					if (running) { drv->stop(dev); running = false; }
-					applog(LOG_ERR, "VU9P %d: %.1f C >= %.0f C: STOPPED (thermal guard)", ci, dev->temp_c, opt_vu9p_tmax);
+					applog(LOG_ERR, "%s: %.1f C >= %.0f C: STOPPED (thermal guard)", dev->label, dev->temp_c, opt_vu9p_tmax);
 				} else if (hot && dev->temp_c < opt_vu9p_tmax - 5) {
 					hot = false; have_work = false;    /* reload the job */
-					applog(LOG_WARNING, "VU9P %d: %.1f C, resuming", ci, dev->temp_c);
+					applog(LOG_WARNING, "%s: %.1f C, resuming", dev->label, dev->temp_c);
 				}
 			}
 		}
@@ -8215,7 +8356,7 @@ static void *vu9p_driver_thread(void *userdata)
 				done_at_stat = done_total;
 				tv_stat = tv_now;
 				drv->status(dev, status, sizeof(status));
-				applog(LOG_INFO, "VU9P %d: %.2f GH/s | %s | %.1f C vccint %.3f V%s", ci, hps / 1e9, status, dev->temp_c,
+				applog(LOG_INFO, "%s: %.2f GH/s | %s | %.1f C vccint %.3f V%s", dev->label, hps / 1e9, status, dev->temp_c,
 				       dev->vccint_v, running ? "" : (hot ? " | thermal stop" : " | idle"));
 			}
 		}
@@ -8349,6 +8490,8 @@ int main(int argc, char *argv[]) {
 
 	if (opt_account && !load_account_file(opt_account))
 		return 1;
+	if (opt_fpga == PLATFORM_ZTEX && algo_table[opt_algo].ztex_driver)
+		opt_use_ztex = false;        /* register-style driver path (ztex_driver_setup), not the classic work/nonce backend */
 	stratum_dialect = algo_table[opt_algo].dialect;
 	stratum.proxi_k_next = -1;
 	stratum.job.proxi_k = -1;
@@ -8360,8 +8503,8 @@ int main(int argc, char *argv[]) {
 	}
 	if ((opt_selftest || opt_program_only) && !rpc_url)
 		rpc_url = strdup("stratum+tcp://127.0.0.1:1");   /* selftest never connects; satisfy the URL check */
-	if (opt_selftest && opt_fpga != PLATFORM_VU9P) {
-		applog(LOG_INFO, "selftest: no VU9P platform selected (--fpga vu9p --device ...), CPU reference check done");
+	if (opt_selftest && opt_fpga != PLATFORM_VU9P && !(opt_fpga == PLATFORM_ZTEX && algo_table[opt_algo].ztex_driver)) {
+		applog(LOG_INFO, "selftest: no FPGA platform selected (--fpga vu9p|ztex), CPU reference check done");
 		return 0;
 	}
 
@@ -8555,6 +8698,8 @@ int main(int argc, char *argv[]) {
 	}
 
 	if (opt_fpga == PLATFORM_VU9P && vu9p_setup(argv[0]))
+		return 1;
+	if (opt_fpga == PLATFORM_ZTEX && algo_table[opt_algo].ztex_driver && ztex_driver_setup())
 		return 1;
 
 	g_fpga_use_midstate = algo_table[opt_algo].midstate;
@@ -8806,8 +8951,8 @@ int main(int argc, char *argv[]) {
 		applog(LOG_INFO, "\t%d VU9P miner threads started.", g_vu9p_card_count);
 	}
 
-	// Register-bridge VU9P boards (--fpga vu9p): one algorithm-agnostic thread per board
-	if (opt_fpga == PLATFORM_VU9P) {
+	// Register-bridge VU9P boards (--fpga vu9p) and driver-based ZTEX FPGAs (--fpga ztex): one algorithm-agnostic thread per device
+	if (vu9p_driver && g_vu9p_count > 0) {
 		for (i = 0; i < g_vu9p_count; i++) {
 			thr = &thr_info[thr_idx];
 			thr->id = thr_idx++;
@@ -8821,7 +8966,7 @@ int main(int argc, char *argv[]) {
 			}
 		}
 		gettimeofday(&g_miner_start_time, NULL);
-		applog(LOG_INFO, "\t%d VU9P FPGA miner threads started.", g_vu9p_count);
+		applog(LOG_INFO, "\t%d %s FPGA miner threads started.", g_vu9p_count, opt_fpga == PLATFORM_ZTEX ? "ZTEX" : "VU9P");
 	}
 
 	// Start the keyboard monitor only after every device-worker slot.  The old

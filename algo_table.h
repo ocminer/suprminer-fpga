@@ -46,6 +46,7 @@ struct algo_info {
 	const char *ztex_bitstream;       /* default under bitstreams/, NULL when the algorithm has no ZTEX image */
 	const char *vu9p_bitstream;       /* default under bitstreams/, NULL when none is bundled (pass --bitstream) */
 	const struct vu9p_algo_driver *vu9p_driver;   /* NULL: no VU9P support for this algorithm */
+	const struct vu9p_algo_driver *ztex_driver;   /* NULL: ZTEX uses the classic USB work/nonce backend */
 	int         fpga_work_len;        /* serial/ZTEX work format */
 	int         nonce_word;
 	bool        midstate;

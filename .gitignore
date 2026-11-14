@@ -86,6 +86,7 @@
 !/bc3_ztex_work_test.c
 !/bitstreams/README.md
 !/bitstreams/ztex_ufm1_15y1.bin
+!/bitstreams/ztex_proxima.bit
 !/byte_order_test.c
 !/compat.h
 !/compat/jansson/CMakeLists.txt
@@ -134,6 +135,7 @@
 !/platform/vu9p_voltage.h
 !/platform/vu9p_proxima.c
 !/platform/vu9p_sha3t.c
+!/platform/ztex_proxima.c
 !/proof_of_concept/README.md
 !/proof_of_concept/rtl/keccak_round.v
 !/proof_of_concept/rtl/sha3_core.v
