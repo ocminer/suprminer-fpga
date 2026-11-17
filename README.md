@@ -160,6 +160,11 @@ The miner never submits before the pool has sent a difficulty.
     --account my-account.json --worker rig1 --user-agent ProxiChorizo/2.0.0-fpga \
     -o stratum+tcp://POOL:PORT
 
+# or without an account file: worker name (or ADDRESS.worker) as user, the pool token as password
+./suprminer-fpga -a proxima --fpga vu9p --device jtag:SERIAL \
+    -u rig1 -p YOUR_TOKEN --user-agent ProxiChorizo/2.0.0-fpga \
+    -o stratum+tcp://POOL:PORT
+
 # several boards, comma separated; a running bridge by host:port
 ./suprminer-fpga -a proxima --fpga vu9p --device jtag:SERIAL0,jtag:SERIAL1,127.0.0.1:13402 ...
 ```
