@@ -837,8 +837,22 @@ void get_currentalgo(char* buf, int sz)
 	snprintf(buf, sz, "%s", algo_names[opt_algo]);
 }
 
+/* VU9P orderly stop (2026-11-18): Ctrl-C used to close every board (direct mode: free the FTDI/JTAG state) while the
+ * board threads were still inside a register access -> use after free, segfault with several boards. Now the board
+ * threads see g_vu9p_stopping, stop their cores and park; the boards are closed after that (or after 3 s). */
+static volatile sig_atomic_t g_vu9p_stopping = 0;
+static volatile int g_vu9p_threads = 0, g_vu9p_parked = 0;
+static __thread int tl_vu9p_thread = 0;
+
 void proper_exit(int reason)
 {
+	if (g_vu9p_threads > 0 && !g_vu9p_stopping) {
+		int need = g_vu9p_threads - (tl_vu9p_thread ? 1 : 0), t;
+		g_vu9p_stopping = 1;
+		for (t = 0; t < 300 && g_vu9p_parked < need; t++)
+			usleep(10000);
+	}
+	g_vu9p_stopping = 1;
 	vu9p_shutdown_all();
 	exit(reason);
 }
@@ -8252,11 +8266,21 @@ static int vu9p_submit_cb(void *ctx, struct work *w)
 	return submit_work((struct thr_info *) ctx, w) ? 0 : -1;
 }
 
+/* board thread: park for good once a stop was requested (cores stopped first) */
+static void vu9p_park_if_stopping(struct vu9p_dev *dev, bool cores)
+{
+	if (!g_vu9p_stopping) return;
+	if (cores && dev->fd >= 0 && vu9p_driver && vu9p_driver->stop) vu9p_driver->stop(dev);
+	__sync_fetch_and_add(&g_vu9p_parked, 1);
+	for (;;) pause();
+}
+
 static void vu9p_reconnect(struct vu9p_dev *dev)
 {
 	int tries = 0;
 	while (1) {
 		nmsleep(5000);
+		vu9p_park_if_stopping(dev, false);
 		if (vu9p_connect(dev, &g_vu9p_tools) == 0 && vu9p_driver->open(dev) == 0)
 			return;
 		if (++tries % 12 == 0)
@@ -8281,11 +8305,15 @@ static void *vu9p_driver_thread(void *userdata)
 	memset(&work, 0, sizeof(work));
 	gettimeofday(&tv_stat, NULL);
 	applog(LOG_INFO, "%s: miner thread %d started, %s driver on %s", dev->label, thr_id, drv->name, dev->spec);
+	tl_vu9p_thread = 1;
+	__sync_fetch_and_add(&g_vu9p_threads, 1);
 
 	while (1) {
 		bool fresh = false;
 		uint64_t cur_epoch;
 		int rc;
+
+		vu9p_park_if_stopping(dev, true);
 
 		if (dev->fd < 0) {
 			running = false; have_work = false;
