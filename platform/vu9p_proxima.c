@@ -47,7 +47,12 @@
 #define ST_HIT       2
 #define ST_CFG_BUSY  4
 
-#define GID_PER_DEVICE 32          /* gid = device index * 32 + core; cores per bitstream must stay <= 32 */
+#define GID_PER_DEVICE 32          /* largest gid stride; cores per bitstream must stay <= 32 */
+/* The 48-bit extranonce2 is {gid[7:0], counter[39:0]}: every core of every device of one miner instance searches its
+ * own counter space under the same pool extranonce1.  gid = device index * stride + core, stride = 16 for images with
+ * <= 16 cores (15-core b2b: up to 16 devices per instance), else 32 (8 devices).  A device whose gids would pass 255
+ * refuses to start instead of repeating another device's work. */
+static uint32_t gid_stride(uint32_t ncores) { return ncores <= 16 ? 16 : 32; }
 #define CNT40_MASK   0xFFFFFFFFFFULL
 
 int    opt_vu9p_kmin = 27;
@@ -84,7 +89,12 @@ static int st_open(struct vu9p_dev *d)
 		applog(LOG_ERR, "VU9P %d: bitstream reports %u cores (expected 1..%d)", d->index, s->ncores, GID_PER_DEVICE);
 		free(s); return -1;
 	}
-	s->gid_base = (uint32_t) d->index * GID_PER_DEVICE;
+	s->gid_base = (uint32_t) d->index * gid_stride(s->ncores);
+	if (s->gid_base + s->ncores > 256) {
+		applog(LOG_ERR, "VU9P %d: too many devices for one instance (%u cores per device, at most %u devices): "
+		       "start another instance for the rest", d->index, s->ncores, 256 / gid_stride(s->ncores));
+		free(s); return -1;
+	}
 	d->algo_state = s;
 	applog(LOG_INFO, "VU9P %d: proxima b2b bitstream %08x: %u cores at %.1f MHz, nominal %.2f GH/s, gid base %u%s",
 	       d->index, d->build_id, s->ncores, s->core_khz / 1000.0, s->ncores * s->core_khz / 1e6, s->gid_base,

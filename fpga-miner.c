@@ -2977,8 +2977,17 @@ static bool stratum_handle_response(char *buf,
 	err_val = json_object_get(val, "error");
 	id_val = json_object_get(val, "id");
 
-	if (!id_val || json_is_null(id_val))
+	if (!id_val || json_is_null(id_val)) {
+		/* 2026-11-18: an error the pool sends without a request id (e.g. about a share it could not
+		 * attribute) is not a protocol violation; log it and keep the connection */
+		if (err_val && !json_is_null(err_val)) {
+			char *e = json_dumps(err_val, JSON_COMPACT);
+			applog(LOG_WARNING, "Stratum error without request id: %.200s", e ? e : "?");
+			free(e);
+			ret = true;
+		}
 		goto out;
+	}
 
 	if (jsonrpc_2)
 	{
@@ -3031,8 +3040,12 @@ static bool stratum_handle_response(char *buf,
 		}
 		/* Exact (received_generation, id) matching is the linearization
 		 * point. A disconnect after the line was removed from that socket
-		 * must not erase an otherwise terminal accepted/rejected response. */
-		if (!json_is_boolean(res_val))
+		 * must not erase an otherwise terminal accepted/rejected response.
+		 * 2026-11-18: a matched submit answered with a non-boolean result
+		 * (null + error, e.g. after the pool raised the difficulty) is a
+		 * rejection, not a malformed line: reconnecting reset the pool's
+		 * difficulty and dropped work every few seconds. */
+		if (!json_is_boolean(res_val) && (!err_val || json_is_null(err_val)))
 			goto out;
 		valid = json_is_true(res_val) &&
 			(!err_val || json_is_null(err_val));
@@ -3189,10 +3202,10 @@ static void *stratum_thread(void *userdata)
 			}
 			if (method_result == STRATUM_METHOD_UNHANDLED &&
 			    !stratum_handle_response(s, received_generation)) {
+				applog(LOG_ERR,
+					"malformed or unmatched Stratum response; reconnecting: %.200s", s);
 				free(s);
 				stratum_disconnect(&stratum);
-				applog(LOG_ERR,
-					"malformed or unmatched Stratum response; reconnecting");
 				continue;
 			}
 		}
