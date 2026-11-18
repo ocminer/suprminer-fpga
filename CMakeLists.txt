@@ -60,6 +60,7 @@ set(SRC_LIST fpga-miner.c
 		./platform/ztex_proxima.c
 		./platform/vu9p_sha3t.c
 		./platform/vu9p_voltage.c
+		./platform/vu9p_clock.c
 		./algo/proxima.c
 		tui.c
 		util.c

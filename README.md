@@ -141,6 +141,24 @@ cable, so set the voltage in direct mode with `hw_server` stopped, then start mi
 Without NextJTAG, or with the cable held by another program, the default is skipped with a warning;
 an explicit `--vu9p-voltage` stops instead.
 
+### Run-time core clock and autotune (tunable images)
+
+Images built with a tunable core clock (FEATURES register bit 1) expose their MMCM through two registers, so the
+miner can change the core frequency without a new bitstream, in steps of a few MHz:
+
+```sh
+--vu9p-clock-table FILE   # MMCM register values per frequency step (generated for the image's clocking)
+--vu9p-clock MHZ          # run at this frequency (nearest table step at or below)
+--vu9p-autotune           # at start: two clean self-tests per step upwards, then run --vu9p-tune-margin
+                          # steps (default 1) below the highest clean one; while mining, 2 hardware errors
+                          # within 10 minutes lower the clock one step
+--vu9p-clock-max MHZ      # autotune ceiling
+```
+
+Table lines are `<core_khz> <mult_x1000> <bandwidth> <n> <addr>:<mask>:<value> ...` (hex, mask = bits kept).
+Before changing anything the miner reads the MMCM back and requires an exact match with a table line, so a table
+that does not belong to the loaded image is never applied. Images without the feature ignore these options.
+
 ### Proxima (txid-blake2b)
 
 The Proxima pool protocol is a stratum dialect: `mining.notify` carries the
@@ -165,7 +183,9 @@ The miner never submits before the pool has sent a difficulty.
     -u rig1 -p YOUR_TOKEN --user-agent ProxiChorizo/2.0.0-fpga \
     -o stratum+tcp://POOL:PORT
 
-# several boards, comma separated; a running bridge by host:port
+# several boards in one instance, comma separated (each board searches its own extranonce2
+# range: gid = board index * 16 + core for images with up to 16 cores, so up to 16 boards);
+# a running bridge by host:port
 ./suprminer-fpga -a proxima --fpga vu9p --device jtag:SERIAL0,jtag:SERIAL1,127.0.0.1:13402 ...
 ```
 

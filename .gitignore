@@ -133,6 +133,8 @@
 !/platform/vu9p_program.tcl
 !/platform/vu9p_voltage.c
 !/platform/vu9p_voltage.h
+!/platform/vu9p_clock.c
+!/platform/vu9p_clock.h
 !/platform/vu9p_proxima.c
 !/platform/vu9p_sha3t.c
 !/platform/ztex_proxima.c

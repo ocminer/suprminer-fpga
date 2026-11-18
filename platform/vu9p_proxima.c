@@ -16,18 +16,24 @@
  *   0x210/0x214   R  head: counter lo / {valid, 15'b0, counter hi 16}
  *   0x218/0x21C   R  head: h3 lo / hi
  *   0x220 R build id   0x224 R cores   0x228/0x22C R core0 counter lo/hi   0x230 R drops
- *   0x234 R core kHz   0x23C R bit0: cfg chain present
+ *   0x234 R core kHz   0x23C R bit0: cfg chain present, bit1: tunable core clock (platform/vu9p_clock.h)
+ *
+ * Tunable images (--vu9p-clock-table): --vu9p-clock sets a frequency; --vu9p-autotune probes upwards from the
+ * image's frequency in table steps at start (two clean self-tests per step), settles --vu9p-tune-margin steps
+ * below the highest clean one, and while mining steps down one step after 2 hardware errors within 10 minutes.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <time.h>
 
 #include "miner.h"
 #include "proxima.h"
 #include "vu9p_bridge.h"
 #include "vu9p_driver.h"
+#include "vu9p_clock.h"
 
 #define R_JOB        0x000
 #define R_CTRL       0x200
@@ -69,7 +75,19 @@ struct proxi_state {
 	uint64_t cnt_at_load;
 	int      running;
 	uint64_t hits_total, submitted;
+	/* tunable core clock */
+	int      tune_pos;              /* table position, -1 = not tunable / unknown */
+	const char *tune_bw;
+	uint64_t hw_seen;
+	time_t   hw_t[2];
 };
+
+#define MAX_TUNE_DEV 64
+static int tune_done[MAX_TUNE_DEV];      /* start-up tuning done once per device (bridge reconnects reopen) */
+static int st_quiet;                     /* selftest: per-vector lines at debug level (autotune probes) */
+static int st_selftest(struct vu9p_dev *d);
+static int clock_open(struct vu9p_dev *d);
+static void clock_on_hw_error(struct vu9p_dev *d);
 
 static int st_stop(struct vu9p_dev *d)
 {
@@ -95,7 +113,9 @@ static int st_open(struct vu9p_dev *d)
 		       "start another instance for the rest", d->index, s->ncores, 256 / gid_stride(s->ncores));
 		free(s); return -1;
 	}
+	s->tune_pos = -1;
 	d->algo_state = s;
+	if ((feat & VU9P_FEAT_TUNE) && feat != 0xDEADBEEF && clock_open(d)) { d->algo_state = NULL; free(s); return -1; }
 	applog(LOG_INFO, "VU9P %d: proxima b2b bitstream %08x: %u cores at %.1f MHz, nominal %.2f GH/s, gid base %u%s",
 	       d->index, d->build_id, s->ncores, s->core_khz / 1000.0, s->ncores * s->core_khz / 1e6, s->gid_base,
 	       s->has_cfg ? ", cfg chain" : "");
@@ -215,6 +235,7 @@ static int st_poll(struct vu9p_dev *d, const struct work *w, vu9p_submit_fn subm
 	if (!s->running) return 0;
 	n = read_hits(d, c48, h3, 64);
 	if (n < 0) return -1;
+	if (n == 0 && d->hw_errors != s->hw_seen) clock_on_hw_error(d);
 	for (i = 0; i < n; i++) {
 		uint8_t digest[32];
 		int wb;
@@ -270,8 +291,10 @@ static int st_expired(const struct work *w)
 static void st_status(struct vu9p_dev *d, char *buf, size_t len)
 {
 	struct proxi_state *s = (struct proxi_state *) d->algo_state;
-	snprintf(buf, len, "hits %llu submitted %llu hw_errors %llu", (unsigned long long) s->hits_total,
+	int n = snprintf(buf, len, "hits %llu submitted %llu hw_errors %llu", (unsigned long long) s->hits_total,
 	         (unsigned long long) s->submitted, (unsigned long long) d->hw_errors);
+	if (s->tune_pos >= 0 && n > 0 && (size_t) n < len)
+		snprintf(buf + n, len - n, " clk %.1f MHz", s->core_khz / 1000.0);
 }
 
 /* ---- self-test against the known-answer vectors (mirrors the host model test) */
@@ -305,7 +328,7 @@ static int st_selftest(struct vu9p_dev *d)
 			checked++;
 		}
 		if (bad || !first_ok) fails++;
-		applog(bad || !first_ok ? LOG_ERR : LOG_INFO, "selftest vector %d (prefix_len %d): %d attempts read back, %d h3 mismatches, vector nonce %s",
+		applog(bad || !first_ok ? (st_quiet ? LOG_DEBUG : LOG_ERR) : (st_quiet ? LOG_DEBUG : LOG_INFO), "selftest vector %d (prefix_len %d): %d attempts read back, %d h3 mismatches, vector nonce %s",
 		       i, v->prefix_len, n, bad, first_ok ? "OK" : "MISSING");
 	}
 	{	/* search test: k = 10 over a short window, the hit set must equal the host's */
@@ -335,14 +358,130 @@ static int st_selftest(struct vu9p_dev *d)
 				if (!found) missing++;
 			}
 		}
-		applog(wrong || missing ? LOG_ERR : LOG_INFO, "selftest search k=10: %d hits, %d wrong, %d missing in the covered windows (cores 0-3), counter %llu",
+		applog(st_quiet ? LOG_DEBUG : (wrong || missing ? LOG_ERR : LOG_INFO), "selftest search k=10: %d hits, %d wrong, %d missing in the covered windows (cores 0-3), counter %llu",
 		       n, wrong, missing, (unsigned long long) cmax);
 		fails += (wrong > 0) + (missing > 0);
 	}
 	st_stop(d);
-	applog(fails ? LOG_ERR : LOG_INFO, "VU9P %d: proxima SELFTEST %s: %d attempts verified against the host hash, %d failures, %d straddle vectors skipped",
+	applog(st_quiet ? LOG_DEBUG : (fails ? LOG_ERR : LOG_INFO), "VU9P %d: proxima SELFTEST %s: %d attempts verified against the host hash, %d failures, %d straddle vectors skipped",
 	       d->index, fails ? "FAIL" : "PASS", checked, fails, skipped);
 	return fails ? -1 : 0;
+}
+
+/* ---- tunable core clock (see vu9p_clock.h) */
+static int clock_to(struct vu9p_dev *d, int pos)
+{
+	struct proxi_state *s = (struct proxi_state *) d->algo_state;
+	const struct vu9p_clk_entry *e = vu9p_clk_get(s->tune_bw, pos);
+	if (!e) return -1;
+	if (vu9p_clk_set(d, s->tune_bw, pos)) {
+		/* back to the last good setting; if that fails too the card stays gated (no wrong hashes) */
+		if (s->tune_pos >= 0 && pos != s->tune_pos && vu9p_clk_set(d, s->tune_bw, s->tune_pos) == 0)
+			applog(LOG_WARNING, "%s: clock change failed, back at %.1f MHz", d->label, s->core_khz / 1000.0);
+		return -1;
+	}
+	s->tune_pos = pos;
+	s->core_khz = e->khz;
+	return 0;
+}
+
+/* two clean self-tests at this position */
+static int clock_probe(struct vu9p_dev *d, int pos)
+{
+	int ok;
+	if (clock_to(d, pos)) return 0;
+	st_quiet = 1;
+	ok = st_selftest(d) == 0 && st_selftest(d) == 0;
+	st_quiet = 0;
+	applog(ok ? LOG_INFO : LOG_WARNING, "%s: autotune %.1f MHz: %s", d->label, d->algo_state ?
+	       ((struct proxi_state *) d->algo_state)->core_khz / 1000.0 : 0.0, ok ? "clean" : "ERRORS");
+	return ok;
+}
+
+static void clock_autotune(struct vu9p_dev *d)
+{
+	struct proxi_state *s = (struct proxi_state *) d->algo_state;
+	int n = vu9p_clk_count(s->tune_bw), top = n - 1, start = s->tune_pos, best = -1, p, fin;
+
+	if (opt_vu9p_clock_max > 0) {
+		int t = vu9p_clk_pos_for_khz(s->tune_bw, (uint32_t)(opt_vu9p_clock_max * 1000 + 0.5));
+		if (t >= 0 && t < top) top = t;
+	}
+	applog(LOG_INFO, "%s: autotune from %.1f MHz up to %.1f MHz, margin %d step(s)", d->label, s->core_khz / 1000.0,
+	       vu9p_clk_get(s->tune_bw, top)->khz / 1000.0, opt_vu9p_tune_margin);
+	if (start > top) start = top;
+	for (p = start; p <= top; p++) {         /* upwards until the first unclean step */
+		if (!clock_probe(d, p)) break;
+		best = p;
+	}
+	if (best < 0)                            /* not even the start was clean: downwards */
+		for (p = start - 1; p >= 0; p--)
+			if (clock_probe(d, p)) { best = p; break; }
+	if (best < 0) {
+		applog(LOG_ERR, "%s: autotune: no clean frequency in the table, staying at the lowest", d->label);
+		clock_to(d, 0);
+		return;
+	}
+	fin = best - opt_vu9p_tune_margin;
+	if (fin < 0) fin = 0;
+	if (clock_to(d, fin)) { applog(LOG_ERR, "%s: autotune: setting the final frequency failed", d->label); return; }
+	applog(LOG_NOTICE, "%s: autotune: highest clean %.1f MHz, running at %.1f MHz (nominal %.2f GH/s)", d->label,
+	       vu9p_clk_get(s->tune_bw, best)->khz / 1000.0, s->core_khz / 1000.0, s->ncores * s->core_khz / 1e6);
+}
+
+static int clock_open(struct vu9p_dev *d)
+{
+	struct proxi_state *s = (struct proxi_state *) d->algo_state;
+	const char *bw = NULL;
+	int pos, first;
+
+	if (!opt_vu9p_clock_table) {
+		if (opt_vu9p_clock > 0 || opt_vu9p_autotune)
+			applog(LOG_WARNING, "%s: tunable image but no --vu9p-clock-table: clock left at %.1f MHz", d->label, s->core_khz / 1000.0);
+		return 0;
+	}
+	if (vu9p_clk_table_load(opt_vu9p_clock_table)) return -1;
+	pos = vu9p_clk_identify(d, s->core_khz, &bw);
+	if (pos < 0) return opt_vu9p_clock > 0 || opt_vu9p_autotune ? -1 : 0;
+	s->tune_bw = bw;
+	s->tune_pos = pos;
+	s->core_khz = vu9p_clk_get(bw, pos)->khz;
+	first = d->index < 0 || d->index >= MAX_TUNE_DEV || !tune_done[d->index];
+	applog(LOG_INFO, "%s: tunable core clock at %.1f MHz (table bandwidth %s, %d steps %.1f-%.1f MHz)%s", d->label,
+	       s->core_khz / 1000.0, bw, vu9p_clk_count(bw), vu9p_clk_get(bw, 0)->khz / 1000.0,
+	       vu9p_clk_get(bw, vu9p_clk_count(bw) - 1)->khz / 1000.0, first ? "" : ", kept from before the reconnect");
+	if (!first) return 0;
+	if (d->index >= 0 && d->index < MAX_TUNE_DEV) tune_done[d->index] = 1;
+	if (opt_vu9p_clock > 0) {
+		int p = vu9p_clk_pos_for_khz(bw, (uint32_t)(opt_vu9p_clock * 1000 + 0.5));
+		if (p < 0) p = 0;
+		if (clock_to(d, p)) return -1;
+		applog(LOG_NOTICE, "%s: core clock set to %.1f MHz", d->label, s->core_khz / 1000.0);
+	}
+	if (opt_vu9p_autotune) clock_autotune(d);
+	return 0;
+}
+
+/* while mining: 2 hardware errors within 10 minutes -> one step down, the job continues past the old counter */
+static void clock_on_hw_error(struct vu9p_dev *d)
+{
+	struct proxi_state *s = (struct proxi_state *) d->algo_state;
+	time_t now = time(NULL);
+	uint64_t c = 0, skip = 1ULL << 24;
+
+	s->hw_seen = d->hw_errors;
+	if (s->tune_pos < 0 || !opt_vu9p_autotune) return;
+	s->hw_t[0] = s->hw_t[1]; s->hw_t[1] = now;
+	if (!s->hw_t[0] || now - s->hw_t[0] > 600) return;
+	if (s->tune_pos == 0) { applog(LOG_ERR, "%s: hardware errors at the lowest clock step", d->label); return; }
+	if (vu9p_wr(d, R_CTRL, 0) || counter(d, &c)) return;
+	if (clock_to(d, s->tune_pos - 1)) return;
+	s->hw_t[0] = s->hw_t[1] = 0;
+	if (load_job(d, &s->job, proxi_kmask(s->k_hw), (c + skip) & CNT40_MASK, s->gid_base) == 0)
+		s->cnt_at_load += skip;
+	else
+		s->running = 0;
+	applog(LOG_WARNING, "%s: 2 hardware errors within 10 min: core clock down to %.1f MHz", d->label, s->core_khz / 1000.0);
 }
 
 const struct vu9p_algo_driver vu9p_proxima_driver = {

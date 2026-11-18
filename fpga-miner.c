@@ -84,6 +84,7 @@
 #include "platform/vu9p_bridge.h"
 #include "platform/vu9p_driver.h"
 #include "platform/vu9p_voltage.h"
+#include "platform/vu9p_clock.h"
 
 static int proxima_submit_append_hash(json_t *params, const struct work *work);
 
@@ -638,6 +639,12 @@ FPGA platform selection (register-bridge backend) ----------------------------\n
                              hw_server must not hold it); without NextJTAG the default is skipped with a warning\n\
       --nextjtag <path>      NextJTAG executable (default: nextjtag in PATH)\n\
       --nextjtag-license <f> NEXTJTAG_LICENSE file for NextJTAG (default: inherit the environment)\n\
+      --vu9p-clock-table <f> VU9P tunable images: MMCM register table (one line per frequency step)\n\
+      --vu9p-clock <MHz>     VU9P tunable images: set the core clock (nearest table step at or below)\n\
+      --vu9p-autotune        VU9P tunable images: probe upwards at start (2 clean self-tests per step), run\n\
+                             --vu9p-tune-margin steps (default 1) below the highest clean one; while mining\n\
+                             2 hardware errors within 10 min lower the clock one step\n\
+      --vu9p-clock-max <MHz> autotune ceiling\n\
       --selftest             Run the algorithm's known-answer test on every device and exit\n\
       --vivado-lab <path>    vivado_lab executable (default: $VIVADO_LAB or PATH)\n\
       --hw-server <host:port> Xilinx hw_server (default 127.0.0.1:3121)\n\
@@ -727,6 +734,11 @@ static struct option const options[] = {
 	{ "vu9p-voltage", 1, NULL, 1088 },
 	{ "nextjtag", 1, NULL, 1089 },
 	{ "nextjtag-license", 1, NULL, 1090 },
+	{ "vu9p-clock-table", 1, NULL, 1091 },
+	{ "vu9p-clock", 1, NULL, 1092 },
+	{ "vu9p-autotune", 0, NULL, 1093 },
+	{ "vu9p-tune-margin", 1, NULL, 1094 },
+	{ "vu9p-clock-max", 1, NULL, 1095 },
 	{ "auto-freq", 0, NULL, 1004 },
 	{ "watts-per-fpga", 1, NULL, 1008 },
 	{ "tui", 0, NULL, 1040 },
@@ -3673,6 +3685,11 @@ void parse_arg(int key, char *arg)
 		break;
 	case 1089: free(opt_nextjtag); opt_nextjtag = strdup(arg); break;
 	case 1090: free(opt_nextjtag_license); opt_nextjtag_license = strdup(arg); break;
+	case 1091: free(opt_vu9p_clock_table); opt_vu9p_clock_table = strdup(arg); break;
+	case 1092: opt_vu9p_clock = atof(arg); break;
+	case 1093: opt_vu9p_autotune = 1; break;
+	case 1094: opt_vu9p_tune_margin = atoi(arg); if (opt_vu9p_tune_margin < 0) opt_vu9p_tune_margin = 0; break;
+	case 1095: opt_vu9p_clock_max = atof(arg); break;
 	case 1086:			/* --vu9p-mode bridge|direct */
 		if (!strcasecmp(arg, "bridge")) opt_vu9p_mode = VU9P_TRANSPORT_BRIDGE;
 		else if (!strcasecmp(arg, "direct") || !strcasecmp(arg, "native")) opt_vu9p_mode = VU9P_TRANSPORT_JTAG;
