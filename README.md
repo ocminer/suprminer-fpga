@@ -157,7 +157,9 @@ miner can change the core frequency without a new bitstream, in steps of a few M
 
 Table lines are `<core_khz> <mult_x1000> <bandwidth> <n> <addr>:<mask>:<value> ...` (hex, mask = bits kept).
 Before changing anything the miner reads the MMCM back and requires an exact match with a table line, so a table
-that does not belong to the loaded image is never applied. Images without the feature ignore these options.
+that does not belong to the loaded image is never applied; on a mismatch it logs the read-back next to the
+nominal table line. `<n>` must equal the number of register entries (a line with more is rejected). Table generators:
+for a fractional CLKFBOUT_MULT_F, Vivado takes the lock and filter settings of the rounded multiplier. Images without the feature ignore these options.
 
 ### Proxima (txid-blake2b)
 

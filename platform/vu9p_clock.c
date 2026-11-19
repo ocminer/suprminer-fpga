@@ -60,6 +60,10 @@ int vu9p_clk_table_load(const char *path)
 			}
 			e.addr[i] = a; e.mask[i] = m; e.val[i] = v;
 		}
+		p += strspn(p, " \t\r\n");
+		if (*p) {   /* more registers than <n> says: a generator bug, refuse instead of dropping them */
+			applog(LOG_ERR, "clock table %s:%d: more registers than the count %d", path, lineno, e.n); fclose(f); return -1;
+		}
 		tab = (struct vu9p_clk_entry *) realloc(tab, (ntab + 1) * sizeof(*tab));
 		tab[ntab++] = e;
 	}
@@ -156,6 +160,22 @@ int vu9p_clk_identify(struct vu9p_dev *d, uint32_t nominal_khz, const char **bw)
 		}
 	applog(LOG_ERR, "%s: the core MMCM registers match no clock table entry: table does not fit this bitstream, "
 	       "clock left unchanged", d->label);
+	{	/* show the difference against the nominal entry (helps to fix a table generator) */
+		const struct vu9p_clk_entry *e = vu9p_clk_get("HIGH", vu9p_clk_pos_for_khz("HIGH", nominal_khz));
+		char buf[512];
+		int n = 0;
+		if (e) {
+			for (i = 0; i < e->n && n < (int) sizeof(buf) - 40; i++) {
+				uint16_t v;
+				if (e->mask[i] == 0 && e->val[i] == 0xffff) continue;
+				if (drp_read(d, e->addr[i], &v)) break;
+				n += snprintf(buf + n, sizeof(buf) - n, " %02x:%04x(table %04x/%04x)", e->addr[i], v,
+					      e->val[i], (uint16_t) ~e->mask[i]);
+			}
+			buf[n] = 0;
+			applog(LOG_INFO, "%s: MMCM read-back vs %.3f MHz entry:%s", d->label, e->khz / 1000.0, buf);
+		}
+	}
 	return -1;
 }
 
