@@ -1925,6 +1925,7 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 {
 	unsigned attempt;
 	uint64_t connection_generation = 0;
+	int configure_on_conn = 0;   /* mining.configure went out on this connection */
 
 	if (jsonrpc_2)
 		return true;
@@ -1972,7 +1973,7 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 			static const char cfg_line[] =
 				"{\"id\":3,\"method\":\"mining.configure\",\"params\":[[\"proxima.aligned-tail.v1\"],{}]}";
 			if (stratum_send_control_line(sctx, cfg_line, connection_generation))
-				configure_sent = 1;
+				configure_sent = configure_on_conn = 1;
 		}
 		request = stratum_subscribe_request(prior_sid, attempt != 0);
 		if (!request)
@@ -2089,6 +2090,10 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 		stratum_work_invalidated();
 		if (opt_debug && sid)
 			applog(LOG_DEBUG, "Stratum session id: %s", sid);
+		/* the pool answered subscribe on a connection that carried mining.configure: it does not close on the
+		 * method, so earlier drops were not the old-pool case (the configure answer may come after this one) */
+		if (configure_on_conn)
+			proxima_cfg_fails = 0;
 		free(prior_sid);
 		free(line);
 		free(response);
