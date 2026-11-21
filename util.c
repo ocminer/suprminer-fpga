@@ -1816,9 +1816,16 @@ out:
 int stratum_dialect = 0;                    /* STRATUM_BTC; main() sets it from the algorithm table */
 const char *stratum_user_agent = USER_AGENT;
 int stratum_proxima_aligned_tail = 0;
-/* Set when a connection carrying mining.configure died before the subscribe answer (an old pool that closes
- * on unknown methods): later connections use the original handshake (PROTOCOL-UPGRADE fallback). */
-static int proxima_configure_disabled = 0;
+/* PROTOCOL-UPGRADE fallback for old pools that close on unknown methods: a connection carrying mining.configure
+ * that dies before any answer counts as a failure; after 3 in a row the next connections use the original
+ * handshake for 10 minutes, then mining.configure is tried again. A single drop (pool restart, network) must not
+ * switch it off for good: aligned-tail-only images idle on ordinary jobs. Once the pool has accepted the
+ * capability in this process it is never switched off. */
+#define PROXIMA_CFG_FAILS   3
+#define PROXIMA_CFG_OFF_S   600
+static int proxima_cfg_fails = 0;
+static int proxima_cfg_accepted = 0;
+static time_t proxima_cfg_off_until = 0;
 
 /* id 3 answer to mining.configure: only a boolean true without an RPC error counts as acceptance. */
 static void stratum_note_configure_reply(json_t *val)
@@ -1831,6 +1838,8 @@ static void stratum_note_configure_reply(json_t *val)
 	}
 	applog(LOG_INFO, "pool %s proxima.aligned-tail.v1 (aligned jobs are detected from their bytes)",
 	       ok ? "accepted" : "declined");
+	proxima_cfg_fails = 0;
+	if (ok) proxima_cfg_accepted = 1;
 }
 
 static json_t *stratum_subscribe_request(const char *session_id,
@@ -1959,7 +1968,7 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 		}
 		configure_sent = 0;
 		if (attempt == 0 && stratum_dialect == 1 /* STRATUM_PROXIMA */ && stratum_proxima_aligned_tail &&
-		    !proxima_configure_disabled) {
+		    time(NULL) >= proxima_cfg_off_until) {
 			static const char cfg_line[] =
 				"{\"id\":3,\"method\":\"mining.configure\",\"params\":[[\"proxima.aligned-tail.v1\"],{}]}";
 			if (stratum_send_control_line(sctx, cfg_line, connection_generation))
@@ -1980,9 +1989,15 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 			response = stratum_recv_line_timeout(sctx, UINT64_C(30000),
 				false, NULL, NULL);
 			if (!response) {
-				if (configure_sent && !proxima_configure_disabled) {
-					proxima_configure_disabled = 1;
-					applog(LOG_WARNING, "pool closed after mining.configure: next connections without it");
+				if (configure_sent && !proxima_cfg_accepted) {
+					if (++proxima_cfg_fails >= PROXIMA_CFG_FAILS) {
+						proxima_cfg_fails = 0;
+						proxima_cfg_off_until = time(NULL) + PROXIMA_CFG_OFF_S;
+						applog(LOG_WARNING, "pool closed %d times after mining.configure: next %d min without it",
+						       PROXIMA_CFG_FAILS, PROXIMA_CFG_OFF_S / 60);
+					} else
+						applog(LOG_WARNING, "pool closed after mining.configure (%d/%d), retrying with it",
+						       proxima_cfg_fails, PROXIMA_CFG_FAILS);
 				}
 				goto attempt_failed;
 			}
