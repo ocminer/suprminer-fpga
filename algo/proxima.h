@@ -40,6 +40,12 @@ int proxi_job_init(struct proxi_job *j, const uint8_t *prefix, size_t prefix_len
  * digest bytes 24..31) for counter C.  Only valid for !straddle jobs. */
 uint64_t proxi_hw_h3(const struct proxi_job *j, uint64_t C);
 
+/* Aligned-tail (zero-tail) cores: state entering their first stage = round 0 with m[0..14] = 0, G0..G6 complete
+ * and G7 half 1 done (m[15] = {C48, en1} enters in G7 half 2).  -1 if the job is not an aligned-tail job. */
+int proxi_job_zt_state(const struct proxi_job *j, uint64_t vz[16]);
+/* Software model of the zero-tail datapath for counter C (must equal proxi_hw_h3). */
+uint64_t proxi_zt_h3(const struct proxi_job *j, const uint64_t vz[16], uint64_t C);
+
 /* Full host hash for counter C: prefix || en1 || le48(C). */
 void proxi_hash_attempt(const struct proxi_job *j, const uint8_t *prefix, uint64_t C, uint8_t out[32]);
 
@@ -52,13 +58,18 @@ uint64_t proxi_kmask(int k);
 /* Little-endian u64 of digest bytes 24..31 (what the FPGA reports as h3). */
 uint64_t proxi_h3_of_digest(const uint8_t digest[32]);
 
+/* proxima.aligned-tail.v1 layout: prefix_len % 128 == 120 and the last 120 prefix bytes zero, so the final
+ * block is 15 zero words plus the nonce as word 15.  Decided from the bytes of every job, never from the
+ * mining.configure acknowledgement. */
+int proxi_is_aligned_tail(const uint8_t *prefix, size_t prefix_len);
+
 /* Difficulty value from mining.set_difficulty -> k (number of required zero bits). */
 int proxi_k_from_difficulty(double diff);
 
 /* Known-answer vectors (Proxima library upgrade 6 + node mine_hash_vectors_test.go). */
 struct proxi_vector {
 	int         prefix_len;
-	int         rule;         /* 0: prefix[i] = (i*7+3) & 0xff, 1: prefix[i] = i & 0xff */
+	int         rule;         /* 0: prefix[i] = (i*7+3) & 0xff, 1: prefix[i] = i & 0xff, 2: as 0 but the last 120 bytes zero (aligned tail) */
 	const char *en1_hex;      /* 4 hex chars */
 	const char *en2_hex;      /* 12 hex chars, byte order as on the wire */
 	const char *hash_hex;     /* 64 hex chars */

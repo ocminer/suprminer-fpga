@@ -136,6 +136,42 @@ uint64_t proxi_hw_h3(const struct proxi_job *j, uint64_t C)
 	return j->cv[3] ^ v[3] ^ v[11];
 }
 
+int proxi_job_zt_state(const struct proxi_job *j, uint64_t vz[16])
+{
+	uint64_t v[16];
+	int i;
+	if (j->straddle || j->W != 15 || j->r != 0 || (j->cst[15] >> 16)) return -1;
+	for (i = 0; i < 15; i++) if (j->cst[i]) return -1;
+	memcpy(v, j->vi, 128);
+	/* round 0 with m[0..14] = 0: G0..G6 complete, G7 up to the point where m[15] enters */
+	G(0, 4,  8, 12, 0, 0); G(1, 5,  9, 13, 0, 0); G(2, 6, 10, 14, 0, 0); G(3, 7, 11, 15, 0, 0);
+	G(0, 5, 10, 15, 0, 0); G(1, 6, 11, 12, 0, 0); G(2, 7,  8, 13, 0, 0);
+	v[3] += v[4]; v[14] = rotr64(v[14] ^ v[3], 32); v[9] += v[14]; v[4] = rotr64(v[4] ^ v[9], 24);
+	memcpy(vz, v, 128);
+	return 0;
+}
+
+uint64_t proxi_zt_h3(const struct proxi_job *j, const uint64_t vz[16], uint64_t C)
+{
+	uint64_t v[16], m[16] = { 0 };
+	int r;
+	m[15] = ((C & PROXI_C48_MASK) << 16) | (j->cst[15] & 0xffff);
+	memcpy(v, vz, 128);
+	v[3] += v[4] + m[15]; v[14] = rotr64(v[14] ^ v[3], 16); v[9] += v[14]; v[4] = rotr64(v[4] ^ v[9], 63);
+	for (r = 1; r < 12; r++) {
+		const uint8_t *s = SIGMA[r];
+		G(0, 4,  8, 12, m[s[ 0]], m[s[ 1]]);
+		G(1, 5,  9, 13, m[s[ 2]], m[s[ 3]]);
+		G(2, 6, 10, 14, m[s[ 4]], m[s[ 5]]);
+		G(3, 7, 11, 15, m[s[ 6]], m[s[ 7]]);
+		G(0, 5, 10, 15, m[s[ 8]], m[s[ 9]]);
+		G(1, 6, 11, 12, m[s[10]], m[s[11]]);
+		G(2, 7,  8, 13, m[s[12]], m[s[13]]);
+		G(3, 4,  9, 14, m[s[14]], m[s[15]]);
+	}
+	return j->cv[3] ^ v[3] ^ v[11];
+}
+
 void proxi_hash_attempt(const struct proxi_job *j, const uint8_t *prefix, uint64_t C, uint8_t out[32])
 {
 	uint8_t *msg = (uint8_t *) malloc(j->prefix_len + PROXI_EN1_LEN + PROXI_EN2_LEN);
@@ -166,6 +202,14 @@ uint64_t proxi_kmask(int k)
 }
 
 uint64_t proxi_h3_of_digest(const uint8_t digest[32]) { return load_le64(digest + 24); }
+
+int proxi_is_aligned_tail(const uint8_t *prefix, size_t prefix_len)
+{
+	size_t i;
+	if (prefix_len < 120 || prefix_len % 128 != 120) return 0;
+	for (i = prefix_len - 120; i < prefix_len; i++) if (prefix[i]) return 0;
+	return 1;
+}
 
 int proxi_k_from_difficulty(double diff)
 {
@@ -225,6 +269,16 @@ const struct proxi_vector proxi_vectors[] = {
 	{248, 1, "0102", "030405060708", "ddddc25892c55fe25c48c9660493f7830aa7ae43f29efabcfce2a329c71e2583"},
 	{256, 1, "0102", "030405060708", "307a1a5b84ff17649608b11a3c701f04ef39548b42e9c432ae1d889fbc56b296"},
 	{300, 1, "0102", "030405060708", "3a8a0f43b3c3d96fe5466a2f1c751ff06308d08ed409b5a5f4d7d069ef14c604"},
+	/* proxima.aligned-tail.v1 layout (prefix_len % 128 == 120, last 120 prefix bytes zero, nonce = message word 15):
+	 * prefix[i] = (i*7+3) & 0xff, then 120 zero bytes; the 120-byte vector equals ProxiChorizo's public example */
+	{120, 2, "0102", "030405060708", "aa14e6e9f8ac9db17e2eea7c66893704519e6a0ceadd3c43b9bff9dd3ca20191"},
+	{248, 2, "0102", "030405060708", "bd2ddcb97be8cb073ebf8a49a41dbddcffe96df3489b23d6c87b160347de8f9f"},
+	{504, 2, "0102", "030405060708", "edc0c70f1bfbfb54c6eb919a0903b2e92173d5ded063bc9d26c8d820592dd638"},
+	{632, 2, "0102", "030405060708", "f8296956147bd4cb2cd371f7f89be0168ca35c7f7cf343a2f83f4c9fb32a6195"},
+	{120, 2, "0102", "000000000861", "c4f2e0bf00013d11886b7ba9e076d9bb6356a90c014a4614ee6776a65b5c7000"},
+	{248, 2, "0102", "000000000c93", "d0a28ce13f9a343b6891828144c271afef171c1a9d7f944aa91a750a1ac8c000"},
+	{504, 2, "0102", "000000000430", "7ad48fc4b523d0b137f0a59876ccc904e4427eb3ce42d348d6d0046adb202000"},
+	{632, 2, "0102", "000000002f1f", "e91217bde34e085eaf290047fe653a549aea7680fb5591252b289e4287a2b000"},
 };
 const int proxi_nvectors = (int)(sizeof(proxi_vectors) / sizeof(proxi_vectors[0]));
 
@@ -232,7 +286,8 @@ void proxi_vector_prefix(const struct proxi_vector *v, uint8_t *prefix)
 {
 	int i;
 	for (i = 0; i < v->prefix_len; i++)
-		prefix[i] = v->rule ? (uint8_t)(i & 0xff) : (uint8_t)((i * 7 + 3) & 0xff);
+		prefix[i] = v->rule == 1 ? (uint8_t)(i & 0xff)
+		          : (v->rule == 2 && i >= v->prefix_len - 120) ? 0 : (uint8_t)((i * 7 + 3) & 0xff);
 }
 
 int proxi_cpu_selfcheck(int verbose)
@@ -251,6 +306,10 @@ int proxi_cpu_selfcheck(int verbose)
 		proxi_hash_attempt(&j, prefix, C, got);
 		h3_ref = proxi_h3_of_digest(got);
 		h3_hw = j.straddle ? h3_ref : proxi_hw_h3(&j, C);
+		if (proxi_is_aligned_tail(prefix, v->prefix_len)) {   /* zero-tail core model must agree */
+			uint64_t vz[16];
+			if (proxi_job_zt_state(&j, vz) || proxi_zt_h3(&j, vz, C) != h3_ref) h3_hw = ~h3_ref;
+		}
 		if (memcmp(got, exp, 32) || h3_hw != h3_ref) {
 			fails++;
 			applog(LOG_ERR, "proxima vector %d (prefix_len %d, rule %d): %s", i, v->prefix_len, v->rule,

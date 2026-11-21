@@ -645,6 +645,7 @@ FPGA platform selection (register-bridge backend) ----------------------------\n
                              --vu9p-tune-margin steps (default 1) below the highest clean one; while mining\n\
                              2 hardware errors within 10 min lower the clock one step\n\
       --vu9p-clock-max <MHz> autotune ceiling\n\
+      --proxima-aligned-tail Proxima: request proxima.aligned-tail.v1 jobs (mining.configure before subscribe)\n\
       --selftest             Run the algorithm's known-answer test on every device and exit\n\
       --vivado-lab <path>    vivado_lab executable (default: $VIVADO_LAB or PATH)\n\
       --hw-server <host:port> Xilinx hw_server (default 127.0.0.1:3121)\n\
@@ -739,6 +740,7 @@ static struct option const options[] = {
 	{ "vu9p-autotune", 0, NULL, 1093 },
 	{ "vu9p-tune-margin", 1, NULL, 1094 },
 	{ "vu9p-clock-max", 1, NULL, 1095 },
+	{ "proxima-aligned-tail", 0, NULL, 1096 },
 	{ "auto-freq", 0, NULL, 1004 },
 	{ "watts-per-fpga", 1, NULL, 1008 },
 	{ "tui", 0, NULL, 1040 },
@@ -3704,6 +3706,7 @@ void parse_arg(int key, char *arg)
 	case 1093: opt_vu9p_autotune = 1; break;
 	case 1094: opt_vu9p_tune_margin = atoi(arg); if (opt_vu9p_tune_margin < 0) opt_vu9p_tune_margin = 0; break;
 	case 1095: opt_vu9p_clock_max = atof(arg); break;
+	case 1096: stratum_proxima_aligned_tail = 1; break;
 	case 1086:			/* --vu9p-mode bridge|direct */
 		if (!strcasecmp(arg, "bridge")) opt_vu9p_mode = VU9P_TRANSPORT_BRIDGE;
 		else if (!strcasecmp(arg, "direct") || !strcasecmp(arg, "native")) opt_vu9p_mode = VU9P_TRANSPORT_JTAG;

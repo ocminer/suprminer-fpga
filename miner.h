@@ -552,6 +552,9 @@ bool stratum_authorize(struct stratum_ctx *sctx, const char *user, const char *p
 extern int stratum_dialect;
 /* User agent sent in mining.subscribe (some pools gate on it); default USER_AGENT. */
 extern const char *stratum_user_agent;
+/* Proxima: request proxima.aligned-tail.v1 with mining.configure before subscribe (--proxima-aligned-tail).
+ * Jobs are still classified by their bytes; the acknowledgement only means the pool may send that layout. */
+extern int stratum_proxima_aligned_tail;
 
 enum stratum_method_result stratum_handle_method(struct stratum_ctx *sctx,
 	const char *s);

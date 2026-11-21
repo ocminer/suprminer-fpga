@@ -1815,6 +1815,23 @@ out:
 
 int stratum_dialect = 0;                    /* STRATUM_BTC; main() sets it from the algorithm table */
 const char *stratum_user_agent = USER_AGENT;
+int stratum_proxima_aligned_tail = 0;
+/* Set when a connection carrying mining.configure died before the subscribe answer (an old pool that closes
+ * on unknown methods): later connections use the original handshake (PROTOCOL-UPGRADE fallback). */
+static int proxima_configure_disabled = 0;
+
+/* id 3 answer to mining.configure: only a boolean true without an RPC error counts as acceptance. */
+static void stratum_note_configure_reply(json_t *val)
+{
+	json_t *res = json_object_get(val, "result"), *err = json_object_get(val, "error"), *cap;
+	int ok = 0;
+	if (json_is_object(res) && (!err || json_is_null(err))) {
+		cap = json_object_get(res, "proxima.aligned-tail.v1");
+		ok = json_is_true(cap);
+	}
+	applog(LOG_INFO, "pool %s proxima.aligned-tail.v1 (aligned jobs are detected from their bytes)",
+	       ok ? "accepted" : "declined");
+}
 
 static json_t *stratum_subscribe_request(const char *session_id,
 	bool retry)
@@ -1928,6 +1945,7 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 		struct stratum_job retired_job = { 0 };
 		const char *sid;
 		bool rejected;
+		int configure_sent;
 
 		if (attempt == 0) {
 			bool had_sid;
@@ -1938,6 +1956,14 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 			pthread_mutex_unlock(&sctx->work_lock);
 			if (had_sid && !prior_sid)
 				goto attempt_failed;
+		}
+		configure_sent = 0;
+		if (attempt == 0 && stratum_dialect == 1 /* STRATUM_PROXIMA */ && stratum_proxima_aligned_tail &&
+		    !proxima_configure_disabled) {
+			static const char cfg_line[] =
+				"{\"id\":3,\"method\":\"mining.configure\",\"params\":[[\"proxima.aligned-tail.v1\"],{}]}";
+			if (stratum_send_control_line(sctx, cfg_line, connection_generation))
+				configure_sent = 1;
 		}
 		request = stratum_subscribe_request(prior_sid, attempt != 0);
 		if (!request)
@@ -1950,15 +1976,33 @@ bool stratum_subscribe(struct stratum_ctx *sctx)
 			applog(LOG_ERR, "stratum_subscribe send failed");
 			goto attempt_failed;
 		}
-		response = stratum_recv_line_timeout(sctx, UINT64_C(30000),
-			false, NULL, NULL);
-		if (!response)
-			goto attempt_failed;
-		val = JSON_LOADS(response, &err);
-		if (!val) {
-			applog(LOG_ERR, "JSON decode failed(%d): %s", err.line,
-				err.text);
-			goto attempt_failed;
+		for (;;) {
+			response = stratum_recv_line_timeout(sctx, UINT64_C(30000),
+				false, NULL, NULL);
+			if (!response) {
+				if (configure_sent && !proxima_configure_disabled) {
+					proxima_configure_disabled = 1;
+					applog(LOG_WARNING, "pool closed after mining.configure: next connections without it");
+				}
+				goto attempt_failed;
+			}
+			val = JSON_LOADS(response, &err);
+			if (!val) {
+				applog(LOG_ERR, "JSON decode failed(%d): %s", err.line,
+					err.text);
+				goto attempt_failed;
+			}
+			/* the configure answer (id 3) may arrive before the subscribe answer */
+			if (configure_sent && json_is_object(val) &&
+			    json_is_integer(json_object_get(val, "id")) &&
+			    json_integer_value(json_object_get(val, "id")) == 3) {
+				stratum_note_configure_reply(val);
+				configure_sent = 0;
+				json_decref(val); val = NULL;
+				free(response); response = NULL;
+				continue;
+			}
+			break;
 		}
 		if (!json_is_object(val)) {
 			applog(LOG_ERR,

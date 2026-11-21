@@ -46,6 +46,7 @@
 #define R_DROPS      0x230
 #define R_CORE_KHZ   0x234
 #define R_FEATURES   0x23C
+#define FEAT_ZT      4      /* FEATURES bit 2: aligned-tail-only core (proxima.aligned-tail.v1 jobs) */
 
 #define CTRL_RUN     1
 #define CTRL_FLUSH   2
@@ -67,6 +68,7 @@ double opt_vu9p_tmax = 85.0;
 struct proxi_state {
 	uint32_t ncores, core_khz;
 	int      has_cfg;
+	int      zt;              /* aligned-tail-only image: loads the zero-tail state, skips other layouts */
 	uint32_t gid_base;
 	struct proxi_job job;
 	uint8_t *prefix;
@@ -102,7 +104,7 @@ static int st_open(struct vu9p_dev *d)
 	uint32_t feat = 0;
 	if (!s) return -1;
 	if (vu9p_rd(d, R_NCORES, &s->ncores) || vu9p_rd(d, R_CORE_KHZ, &s->core_khz)) { free(s); return -1; }
-	if (vu9p_rd(d, R_FEATURES, &feat) == 0) s->has_cfg = feat & 1;
+	if (vu9p_rd(d, R_FEATURES, &feat) == 0 && feat != 0xDEADBEEF) { s->has_cfg = feat & 1; s->zt = !!(feat & FEAT_ZT); }
 	if (s->ncores == 0 || s->ncores > GID_PER_DEVICE) {
 		applog(LOG_ERR, "VU9P %d: bitstream reports %u cores (expected 1..%d)", d->index, s->ncores, GID_PER_DEVICE);
 		free(s); return -1;
@@ -119,6 +121,10 @@ static int st_open(struct vu9p_dev *d)
 	applog(LOG_INFO, "VU9P %d: proxima b2b bitstream %08x: %u cores at %.1f MHz, nominal %.2f GH/s, gid base %u%s",
 	       d->index, d->build_id, s->ncores, s->core_khz / 1000.0, s->ncores * s->core_khz / 1e6, s->gid_base,
 	       s->has_cfg ? ", cfg chain" : "");
+	if (s->zt)
+		applog(stratum_proxima_aligned_tail ? LOG_INFO : LOG_WARNING,
+		       "VU9P %d: aligned-tail-only image: mines proxima.aligned-tail.v1 jobs only%s", d->index,
+		       stratum_proxima_aligned_tail ? "" : " (start with --proxima-aligned-tail, otherwise it idles)");
 	return st_stop(d);
 }
 
@@ -139,7 +145,12 @@ static int load_job(struct vu9p_dev *d, const struct proxi_job *j, uint64_t kmas
 	if (vu9p_wr(d, R_CTRL, CTRL_FLUSH) || vu9p_wr(d, R_CTRL, 0)) return -1;
 	for (i = 0; i < 16; i++) { words[n++] = (uint32_t) j->cst[i]; words[n++] = (uint32_t)(j->cst[i] >> 32); }
 	for (i = 0; i < 16; i++) { words[n++] = (uint32_t) j->M[i];   words[n++] = (uint32_t)(j->M[i] >> 32); }
-	for (i = 0; i < 16; i++) { words[n++] = (uint32_t) j->vi[i];  words[n++] = (uint32_t)(j->vi[i] >> 32); }
+	if (s->zt) {   /* zero-tail core: state entering its first stage instead of the round-0 input */
+		uint64_t vz[16];
+		if (proxi_job_zt_state(j, vz)) return -1;
+		for (i = 0; i < 16; i++) { words[n++] = (uint32_t) vz[i]; words[n++] = (uint32_t)(vz[i] >> 32); }
+	} else
+		for (i = 0; i < 16; i++) { words[n++] = (uint32_t) j->vi[i];  words[n++] = (uint32_t)(j->vi[i] >> 32); }
 	words[n++] = (uint32_t) j->cv[3]; words[n++] = (uint32_t)(j->cv[3] >> 32);
 	words[n++] = (uint32_t) kmask;    words[n++] = (uint32_t)(kmask >> 32);
 	words[n++] = (uint32_t) j->s1;
@@ -210,6 +221,12 @@ static int st_start(struct vu9p_dev *d, const struct work *w)
 		st_stop(d);
 		return 1;
 	}
+	if (s->zt && !proxi_is_aligned_tail(w->proxi_prefix, w->proxi_prefix_len)) {
+		applog(LOG_WARNING, "VU9P %d: job %s: ordinary layout (prefix_len %zu) on an aligned-tail-only image, skipped",
+		       d->index, w->job_id, w->proxi_prefix_len);
+		st_stop(d);
+		return 1;
+	}
 	free(s->prefix);
 	s->prefix = (uint8_t *) malloc(w->proxi_prefix_len);
 	memcpy(s->prefix, w->proxi_prefix, w->proxi_prefix_len);
@@ -220,8 +237,10 @@ static int st_start(struct vu9p_dev *d, const struct work *w)
 	s->cnt_at_load = 0;
 	if (load_job(d, &s->job, proxi_kmask(s->k_hw), 0, s->gid_base)) return -1;
 	s->running = 1;
-	applog(LOG_INFO, "VU9P %d: job %s slot %u prefix_len %zu shape W=%d r=%d k_pool=%d k_hw=%d ttl=%.0fs%s",
-	       d->index, w->job_id, w->proxi_slot, s->prefix_len, s->job.W, s->job.r, s->k_pool, s->k_hw, w->proxi_ttl,
+	applog(LOG_INFO, "VU9P %d: job %s slot %u prefix_len %zu%s shape W=%d r=%d k_pool=%d k_hw=%d ttl=%.0fs%s",
+	       d->index, w->job_id, w->proxi_slot, s->prefix_len,
+	       proxi_is_aligned_tail(s->prefix, s->prefix_len) ? " aligned-tail" : "",
+	       s->job.W, s->job.r, s->k_pool, s->k_hw, w->proxi_ttl,
 	       w->proxi_clean ? " clean" : "");
 	return 0;
 }
@@ -312,7 +331,8 @@ static int st_selftest(struct vu9p_dev *d)
 		proxi_vector_prefix(v, prefix);
 		hex2bin(en1, v->en1_hex, 2); hex2bin(en2, v->en2_hex, 6); hex2bin(exp, v->hash_hex, 32);
 		C = proxi_c48_from_en2(en2);
-		if (proxi_job_init(&job, prefix, v->prefix_len, en1) || job.straddle) { skipped++; continue; }
+		if (proxi_job_init(&job, prefix, v->prefix_len, en1) || job.straddle ||
+		    (s->zt && !proxi_is_aligned_tail(prefix, v->prefix_len))) { skipped++; continue; }
 		/* kmask 0: every attempt hits; the FIFO captures the first few hundred attempts, which must be
 		 * C, C+1, ... per core, each with the right digest tail */
 		if (load_job(d, &job, 0, C & CNT40_MASK, (uint32_t)(C >> 40))) return -1;
@@ -334,6 +354,9 @@ static int st_selftest(struct vu9p_dev *d)
 	{	/* search test: k = 10 over a short window, the hit set must equal the host's */
 		const struct proxi_vector *v = &proxi_vectors[0];
 		int n, k, wrong = 0, missing = 0, gid;
+		if (s->zt)   /* aligned-tail-only image: search on an aligned-tail vector (504 bytes) */
+			for (k = 0; k < proxi_nvectors; k++)
+				if (proxi_vectors[k].rule == 2 && proxi_vectors[k].prefix_len == 504) { v = &proxi_vectors[k]; break; }
 		uint64_t cmax;
 		proxi_vector_prefix(v, prefix); hex2bin(en1, v->en1_hex, 2);
 		proxi_job_init(&job, prefix, v->prefix_len, en1);
@@ -363,8 +386,8 @@ static int st_selftest(struct vu9p_dev *d)
 		fails += (wrong > 0) + (missing > 0);
 	}
 	st_stop(d);
-	applog(st_quiet ? LOG_DEBUG : (fails ? LOG_ERR : LOG_INFO), "VU9P %d: proxima SELFTEST %s: %d attempts verified against the host hash, %d failures, %d straddle vectors skipped",
-	       d->index, fails ? "FAIL" : "PASS", checked, fails, skipped);
+	applog(st_quiet ? LOG_DEBUG : (fails ? LOG_ERR : LOG_INFO), "VU9P %d: proxima SELFTEST %s: %d attempts verified against the host hash, %d failures, %d vectors skipped (straddle%s)",
+	       d->index, fails ? "FAIL" : "PASS", checked, fails, skipped, s->zt ? " or not aligned-tail" : "");
 	return fails ? -1 : 0;
 }
 

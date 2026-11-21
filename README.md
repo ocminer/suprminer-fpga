@@ -194,6 +194,15 @@ The miner never submits before the pool has sent a difficulty.
 `--kmin` limits the hit rate the board reports (default 2^27 per hit), `--tmax`
 is the thermal stop (default 85 C, resume 5 C lower). The miner prints the
 measured counter rate, verified hits and hardware errors every 30 seconds.
+#### Aligned-tail jobs (proxima.aligned-tail.v1)
+
+With `--proxima-aligned-tail` the miner asks the pool for `proxima.aligned-tail.v1` jobs (`mining.configure` before
+`mining.subscribe`). In that layout the prefix length is 120 modulo 128 and the last 120 prefix bytes are zero, so the
+final BLAKE2b block holds only the 8-byte nonce. Jobs are classified from their bytes, never from the pool's answer;
+a pool that closes the connection on `mining.configure` is retried with the plain handshake. Images that report
+FEATURES bit 2 contain aligned-tail-only cores: they mine these jobs only and skip any other layout (start them with
+`--proxima-aligned-tail`). The self-test then runs the 8 aligned-tail vectors only.
+
 ### Proxima on ZTEX 1.15y (Spartan-6) boards
 
 `bitstreams/ztex_proxima.bit` is a **proof of concept** for the ZTEX USB-FPGA 1.15y (4 x XC6SLX150-3): one
